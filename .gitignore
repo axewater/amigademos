@@ -1,0 +1,4 @@
+*.bin
+*.adf
+*.o
+tables.i
