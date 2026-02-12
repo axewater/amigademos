@@ -2,7 +2,7 @@
 ; DEWDZKI-FXP Main Demo
 ; Loaded at $49000 by bootblock trackloader
 ; OCS A500 PAL — 2 bitplanes, 384px wide
-; Effects: copper raster bars, sine-wave logo, tunnel starfield
+; Effects: copper raster bars, sine-wave logo, shape-cycling starfield
 ;----------------------------------------------------------
 
 ; Memory map (chip RAM)
@@ -11,8 +11,7 @@ COPPER_B	equ	$41800		; copper list back buffer (6 KB)
 BPLANE1		equ	$43000		; bitplane 1: logo (48*256 = 12 KB)
 BPLANE2		equ	$46000		; bitplane 2: stars (48*256 = 12 KB)
 
-; Cube target array and star array in free chip RAM before buffers
-CUBE_TARGETS	equ	$3F880		; 120*6 = 720 bytes
+; Star array in free chip RAM before buffers
 STAR_ARRAY	equ	$3FB50		; 120*10 = 1200 bytes
 
 ; Display parameters
@@ -30,20 +29,17 @@ CENTER_X	equ	192		; screen center X
 CENTER_Y	equ	128		; screen center Y
 ORBIT_RADIUS	equ	31		; +/-31 pixels orbit
 
-; Cube constants
-CUBE_HALF	equ	80		; coordinates +/- 80
-CUBE_BASE_Z	equ	160		; Z offset for projection
-CUBE_EDGES	equ	12
-STARS_PER_EDGE	equ	10
-CUBE_STEP	equ	16		; 160/10 = step per star along edge
+; Shape rotation
+SHAPE_BASE_Z	equ	160		; Z offset for projection
 
 ; Effect states
 EFFECT_TUNNEL	equ	0
 EFFECT_MORPH	equ	1
-EFFECT_CUBE	equ	2
+EFFECT_DISPLAY	equ	2
 
-; Timing
-MORPH_START_FRAME equ	350		; ~7 seconds at 50fps
+; Shape cycling
+NUM_SHAPES	equ	4
+SHAPE_DISPLAY_TIME equ	250		; 5 seconds at 50fps
 MORPH_DURATION	equ	128		; frames to morph
 
 ; Star struct offsets
@@ -107,12 +103,10 @@ Start:
 	; Init stars
 	bsr.w	InitStars
 
-	; Generate cube target positions
-	bsr.w	GenerateCubeTargets
-
-	; Init effect state
+	; Init shape cycling state
 	clr.w	effect_state
-	clr.w	frame_counter
+	clr.w	shape_index
+	clr.w	display_timer
 	clr.w	morph_counter
 	clr.w	angle_y
 	clr.w	angle_x
@@ -153,28 +147,32 @@ MainLoop:
 	move.l	cop_front(pc),COP1LCH(a6)
 	move.w	COPJMP1(a6),d0
 
-	; State dispatch: tunnel / morph / cube
-	addq.w	#1,frame_counter
+	; State dispatch: tunnel / morph / display
 	move.w	effect_state(pc),d0
 	cmp.w	#EFFECT_MORPH,d0
 	beq.w	.doMorph
-	cmp.w	#EFFECT_CUBE,d0
-	beq.w	.doCube
+	cmp.w	#EFFECT_DISPLAY,d0
+	beq.w	.doDisplay
 
 	; --- TUNNEL state ---
 	bsr.w	UpdateStars
-	move.w	frame_counter(pc),d0
-	cmp.w	#MORPH_START_FRAME,d0
+	addq.w	#1,display_timer
+	move.w	display_timer(pc),d0
+	cmp.w	#SHAPE_DISPLAY_TIME,d0
 	blt.s	.stateEnd
-	; Transition to morph
-	bsr.w	StartMorph
+	bsr.w	StartNextMorph
 	bra.s	.stateEnd
 
 .doMorph:
 	bsr.w	MorphStars
 	bra.s	.stateEnd
-.doCube:
-	bsr.w	CubeStars
+.doDisplay:
+	bsr.w	DisplayShape
+	addq.w	#1,display_timer
+	move.w	display_timer(pc),d0
+	cmp.w	#SHAPE_DISPLAY_TIME,d0
+	blt.s	.stateEnd
+	bsr.w	StartNextMorph
 .stateEnd:
 
 	; Build next frame into back buffer
@@ -201,10 +199,12 @@ sine_phase:	dc.w	0
 orbit_phase:	dc.w	0
 lfsr_state:	dc.w	$ACE1
 effect_state:	dc.w	0
-frame_counter:	dc.w	0
 morph_counter:	dc.w	0
 angle_y:	dc.w	0
 angle_x:	dc.w	0
+shape_index:	dc.w	0		; 0=tunnel, 1=cube, 2=sphere, 3=pyramid
+display_timer:	dc.w	0		; frames in current display/tunnel
+current_targets: dc.l	0		; pointer to active target array
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -424,70 +424,39 @@ UpdateStars:
 	rts
 
 ;==========================================================
-; Cube edge table: 12 edges × 6 words (sx,sy,sz,dx,dy,dz)
-; Each edge has 10 stars spaced by step of 16 along the edge
-; Coordinates in range -80..+80
+; StartNextMorph — advance to next shape and begin morph
 ;==========================================================
-CubeEdgeTable:
-	; Bottom face edges (y = -80)
-	dc.w	-80,-80,-80, 16,  0,  0	; edge 0: (-80,-80,-80) → (+80,-80,-80)
-	dc.w	-80,-80, 80, 16,  0,  0	; edge 1: (-80,-80,+80) → (+80,-80,+80)
-	dc.w	-80,-80,-80,  0,  0, 16	; edge 2: (-80,-80,-80) → (-80,-80,+80)
-	dc.w	 80,-80,-80,  0,  0, 16	; edge 3: (+80,-80,-80) → (+80,-80,+80)
-	; Top face edges (y = +80)
-	dc.w	-80, 80,-80, 16,  0,  0	; edge 4: (-80,+80,-80) → (+80,+80,-80)
-	dc.w	-80, 80, 80, 16,  0,  0	; edge 5: (-80,+80,+80) → (+80,+80,+80)
-	dc.w	-80, 80,-80,  0,  0, 16	; edge 6: (-80,+80,-80) → (-80,+80,+80)
-	dc.w	 80, 80,-80,  0,  0, 16	; edge 7: (+80,+80,-80) → (+80,+80,+80)
-	; Vertical edges (connecting top and bottom)
-	dc.w	-80,-80,-80,  0, 16,  0	; edge 8:  (-80,-80,-80) → (-80,+80,-80)
-	dc.w	 80,-80,-80,  0, 16,  0	; edge 9:  (+80,-80,-80) → (+80,+80,-80)
-	dc.w	-80,-80, 80,  0, 16,  0	; edge 10: (-80,-80,+80) → (-80,+80,+80)
-	dc.w	 80,-80, 80,  0, 16,  0	; edge 11: (+80,-80,+80) → (+80,+80,+80)
-
-;==========================================================
-; GenerateCubeTargets — fill CUBE_TARGETS with 120 target
-; positions (12 edges × 10 stars), 6 bytes each (x,y,z words)
-;==========================================================
-GenerateCubeTargets:
-	movem.l	d0-d7/a0-a1,-(sp)
-	lea	CubeEdgeTable(pc),a0
-	lea	CUBE_TARGETS,a1
-	moveq	#CUBE_EDGES-1,d4
-.edgeLoop:
-	move.w	(a0)+,d0		; start_x
-	move.w	(a0)+,d1		; start_y
-	move.w	(a0)+,d2		; start_z
-	move.w	(a0)+,d3		; dx
-	move.w	(a0)+,d5		; dy
-	move.w	(a0)+,d6		; dz
-
-	moveq	#STARS_PER_EDGE-1,d7
-.starLoop:
-	move.w	d0,(a1)+		; target x
-	move.w	d1,(a1)+		; target y
-	move.w	d2,(a1)+		; target z
-	add.w	d3,d0			; x += dx
-	add.w	d5,d1			; y += dy
-	add.w	d6,d2			; z += dz
-	dbf	d7,.starLoop
-
-	dbf	d4,.edgeLoop
-	movem.l	(sp)+,d0-d7/a0-a1
-	rts
-
-;==========================================================
-; StartMorph — transition from tunnel to morph state
-;==========================================================
-StartMorph:
+StartNextMorph:
+	; Advance shape_index cyclically
+	move.w	shape_index(pc),d0
+	addq.w	#1,d0
+	cmp.w	#NUM_SHAPES,d0
+	blt.s	.noWrap
+	clr.w	d0
+.noWrap:
+	move.w	d0,shape_index
+	; Look up target pointer
+	add.w	d0,d0
+	add.w	d0,d0			; x4 for longword index
+	lea	TargetPtrTable(pc),a0
+	move.l	0(a0,d0.w),current_targets
+	; Enter morph state
 	move.w	#EFFECT_MORPH,effect_state
 	clr.w	morph_counter
-	clr.w	angle_y
-	clr.w	angle_x
+	clr.w	display_timer
 	rts
 
 ;==========================================================
-; MorphStars — ease stars toward cube targets, rotate, project
+; Target pointer lookup table (shape_index 0..3)
+;==========================================================
+TargetPtrTable:
+	dc.l	tunnel_targets		; shape 0 = tunnel
+	dc.l	cube_targets		; shape 1 = cube
+	dc.l	sphere_targets		; shape 2 = sphere
+	dc.l	pyramid_targets		; shape 3 = pyramid
+
+;==========================================================
+; MorphStars — ease stars toward current targets, rotate, project
 ; Uses exponential ease: pos += (target - pos) >> 3
 ;==========================================================
 MorphStars:
@@ -526,7 +495,7 @@ MorphStars:
 	move.w	d2,-(sp)		; cos_y [4(sp)]
 	move.w	d1,-(sp)		; sin_y [6(sp)]
 
-	lea	CUBE_TARGETS,a1
+	move.l	current_targets(pc),a1
 
 	move.w	#NUM_STARS-1,d7
 
@@ -598,7 +567,7 @@ MorphStars:
 	asr.l	#7,d4			; d4 = z''
 
 	; Add base Z for projection
-	add.w	#CUBE_BASE_Z,d4
+	add.w	#SHAPE_BASE_Z,d4
 
 	; Project: recip lookup
 	cmp.w	#MIN_Z,d4
@@ -669,17 +638,27 @@ MorphStars:
 	move.w	morph_counter(pc),d0
 	cmp.w	#MORPH_DURATION,d0
 	blt.s	.morphNotDone
-	move.w	#EFFECT_CUBE,effect_state
+	; Morph complete — decide next state
+	move.w	shape_index(pc),d0
+	tst.w	d0
+	bne.s	.toDisplay
+	; shape_index 0 = tunnel
+	move.w	#EFFECT_TUNNEL,effect_state
+	clr.w	display_timer
+	bra.s	.morphNotDone
+.toDisplay:
+	move.w	#EFFECT_DISPLAY,effect_state
+	clr.w	display_timer
 .morphNotDone:
 
 	movem.l	(sp)+,d2-d7/a2-a5
 	rts
 
 ;==========================================================
-; CubeStars — rotate cube targets, project, plot
-; Pure rotation mode (no easing, positions = cube targets)
+; DisplayShape — rotate shape targets, project, plot
+; Pure rotation mode (no easing, positions = current targets)
 ;==========================================================
-CubeStars:
+DisplayShape:
 	movem.l	d2-d7/a2-a5,-(sp)
 
 	lea	BPLANE2,a0
@@ -715,7 +694,7 @@ CubeStars:
 	move.w	d2,-(sp)		; cos_y [4(sp)]
 	move.w	d1,-(sp)		; sin_y [6(sp)]
 
-	lea	CUBE_TARGETS,a1
+	move.l	current_targets(pc),a1
 
 	move.w	#NUM_STARS-1,d7
 
@@ -769,7 +748,7 @@ CubeStars:
 	asr.l	#7,d4			; z''
 
 	; Add base Z
-	add.w	#CUBE_BASE_Z,d4
+	add.w	#SHAPE_BASE_Z,d4
 
 	; Project
 	cmp.w	#MIN_Z,d4
