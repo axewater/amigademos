@@ -56,43 +56,27 @@ def gen_yoffset_table():
     return "\n".join(lines)
 
 def gen_gradient_table():
-    """256-word gradient table: rainbow bars with dark gaps."""
-    lines = ["; Gradient table: 256 words (Amiga RGB4 colors)"]
+    """256-word gradient table: gold/silver flowing into each other, no black."""
+    lines = ["; Gradient table: 256 words (gold/silver flow, no black)"]
     lines.append("gradient_table:")
     colors = []
     for i in range(256):
-        # Create 3 raster bars using raised cosine envelopes
-        brightness = 0.0
-        for bar in range(3):
-            center = 43 + bar * 72  # bar centers at ~43, 115, 187
-            dist = abs(i - center)
-            if dist < 28:
-                brightness = max(brightness, 0.5 + 0.5 * math.cos(math.pi * dist / 28))
+        # Smooth sine blend between gold and silver, never fading to black
+        # t oscillates 0..1..0 over 256 entries (one full cycle)
+        t = 0.5 + 0.5 * math.sin(2 * math.pi * i / 256)
 
-        if brightness < 0.05:
-            colors.append(0x000)
-            continue
+        # Gold:   RGB ~ (1.0, 0.75, 0.2)  → Amiga $FB3
+        # Silver: RGB ~ (0.85, 0.85, 0.95) → Amiga $DDF
+        # Brightness modulation: gentle wave between 0.6 and 1.0
+        bright = 0.7 + 0.3 * math.sin(2 * math.pi * i / 128)
 
-        # HSV rainbow: hue rotates with position
-        hue = (i * 3) % 360
-        h = hue / 60.0
-        sector = int(h) % 6
-        frac = h - int(h)
-        v = brightness
-        p = 0
-        q = v * (1 - frac)
-        t = v * frac
+        r = (1.0 * t + 0.85 * (1 - t)) * bright
+        g = (0.75 * t + 0.85 * (1 - t)) * bright
+        b = (0.2 * t + 0.95 * (1 - t)) * bright
 
-        if sector == 0:   r, g, b = v, t, p
-        elif sector == 1: r, g, b = q, v, p
-        elif sector == 2: r, g, b = p, v, t
-        elif sector == 3: r, g, b = p, q, v
-        elif sector == 4: r, g, b = t, p, v
-        else:             r, g, b = v, p, q
-
-        ri = min(15, int(r * 15 + 0.5))
-        gi = min(15, int(g * 15 + 0.5))
-        bi = min(15, int(b * 15 + 0.5))
+        ri = min(15, max(1, int(r * 15 + 0.5)))
+        gi = min(15, max(1, int(g * 15 + 0.5)))
+        bi = min(15, max(1, int(b * 15 + 0.5)))
         colors.append((ri << 8) | (gi << 4) | bi)
 
     for i in range(0, 256, 8):

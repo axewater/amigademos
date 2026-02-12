@@ -11,7 +11,8 @@ COPPER_B	equ	$41800		; copper list back buffer (6 KB)
 BPLANE1		equ	$43000		; bitplane 1: logo (48*256 = 12 KB)
 BPLANE2		equ	$46000		; bitplane 2: stars (48*256 = 12 KB)
 
-; Star array in free chip RAM before buffers
+; Cube target array and star array in free chip RAM before buffers
+CUBE_TARGETS	equ	$3F880		; 120*6 = 720 bytes
 STAR_ARRAY	equ	$3FB50		; 120*10 = 1200 bytes
 
 ; Display parameters
@@ -28,6 +29,22 @@ Z_SPEED		equ	2
 CENTER_X	equ	192		; screen center X
 CENTER_Y	equ	128		; screen center Y
 ORBIT_RADIUS	equ	31		; +/-31 pixels orbit
+
+; Cube constants
+CUBE_HALF	equ	80		; coordinates +/- 80
+CUBE_BASE_Z	equ	160		; Z offset for projection
+CUBE_EDGES	equ	12
+STARS_PER_EDGE	equ	10
+CUBE_STEP	equ	16		; 160/10 = step per star along edge
+
+; Effect states
+EFFECT_TUNNEL	equ	0
+EFFECT_MORPH	equ	1
+EFFECT_CUBE	equ	2
+
+; Timing
+MORPH_START_FRAME equ	350		; ~7 seconds at 50fps
+MORPH_DURATION	equ	128		; frames to morph
 
 ; Star struct offsets
 STAR_SX		equ	0		; signed X offset
@@ -90,6 +107,16 @@ Start:
 	; Init stars
 	bsr.w	InitStars
 
+	; Generate cube target positions
+	bsr.w	GenerateCubeTargets
+
+	; Init effect state
+	clr.w	effect_state
+	clr.w	frame_counter
+	clr.w	morph_counter
+	clr.w	angle_y
+	clr.w	angle_x
+
 	; Build initial copper list in buffer A
 	lea	COPPER_A,a0
 	bsr.w	BuildCopper
@@ -126,8 +153,29 @@ MainLoop:
 	move.l	cop_front(pc),COP1LCH(a6)
 	move.w	COPJMP1(a6),d0
 
-	; Update stars (before BuildCopper for timing)
+	; State dispatch: tunnel / morph / cube
+	addq.w	#1,frame_counter
+	move.w	effect_state(pc),d0
+	cmp.w	#EFFECT_MORPH,d0
+	beq.w	.doMorph
+	cmp.w	#EFFECT_CUBE,d0
+	beq.w	.doCube
+
+	; --- TUNNEL state ---
 	bsr.w	UpdateStars
+	move.w	frame_counter(pc),d0
+	cmp.w	#MORPH_START_FRAME,d0
+	blt.s	.stateEnd
+	; Transition to morph
+	bsr.w	StartMorph
+	bra.s	.stateEnd
+
+.doMorph:
+	bsr.w	MorphStars
+	bra.s	.stateEnd
+.doCube:
+	bsr.w	CubeStars
+.stateEnd:
 
 	; Build next frame into back buffer
 	move.l	cop_back(pc),a0
@@ -141,7 +189,7 @@ MainLoop:
 	addq.w	#2,orbit_phase
 	and.w	#$FF,orbit_phase
 
-	bra.s	MainLoop
+	bra.w	MainLoop
 
 ;==========================================================
 ; Variables
@@ -152,6 +200,11 @@ gradient_phase:	dc.w	0
 sine_phase:	dc.w	0
 orbit_phase:	dc.w	0
 lfsr_state:	dc.w	$ACE1
+effect_state:	dc.w	0
+frame_counter:	dc.w	0
+morph_counter:	dc.w	0
+angle_y:	dc.w	0
+angle_x:	dc.w	0
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -366,6 +419,419 @@ UpdateStars:
 .nextStar:
 	lea	STAR_SIZE(a2),a2
 	dbf	d7,.starLoop
+
+	movem.l	(sp)+,d2-d7/a2-a5
+	rts
+
+;==========================================================
+; Cube edge table: 12 edges × 6 words (sx,sy,sz,dx,dy,dz)
+; Each edge has 10 stars spaced by step of 16 along the edge
+; Coordinates in range -80..+80
+;==========================================================
+CubeEdgeTable:
+	; Bottom face edges (y = -80)
+	dc.w	-80,-80,-80, 16,  0,  0	; edge 0: (-80,-80,-80) → (+80,-80,-80)
+	dc.w	-80,-80, 80, 16,  0,  0	; edge 1: (-80,-80,+80) → (+80,-80,+80)
+	dc.w	-80,-80,-80,  0,  0, 16	; edge 2: (-80,-80,-80) → (-80,-80,+80)
+	dc.w	 80,-80,-80,  0,  0, 16	; edge 3: (+80,-80,-80) → (+80,-80,+80)
+	; Top face edges (y = +80)
+	dc.w	-80, 80,-80, 16,  0,  0	; edge 4: (-80,+80,-80) → (+80,+80,-80)
+	dc.w	-80, 80, 80, 16,  0,  0	; edge 5: (-80,+80,+80) → (+80,+80,+80)
+	dc.w	-80, 80,-80,  0,  0, 16	; edge 6: (-80,+80,-80) → (-80,+80,+80)
+	dc.w	 80, 80,-80,  0,  0, 16	; edge 7: (+80,+80,-80) → (+80,+80,+80)
+	; Vertical edges (connecting top and bottom)
+	dc.w	-80,-80,-80,  0, 16,  0	; edge 8:  (-80,-80,-80) → (-80,+80,-80)
+	dc.w	 80,-80,-80,  0, 16,  0	; edge 9:  (+80,-80,-80) → (+80,+80,-80)
+	dc.w	-80,-80, 80,  0, 16,  0	; edge 10: (-80,-80,+80) → (-80,+80,+80)
+	dc.w	 80,-80, 80,  0, 16,  0	; edge 11: (+80,-80,+80) → (+80,+80,+80)
+
+;==========================================================
+; GenerateCubeTargets — fill CUBE_TARGETS with 120 target
+; positions (12 edges × 10 stars), 6 bytes each (x,y,z words)
+;==========================================================
+GenerateCubeTargets:
+	movem.l	d0-d7/a0-a1,-(sp)
+	lea	CubeEdgeTable(pc),a0
+	lea	CUBE_TARGETS,a1
+	moveq	#CUBE_EDGES-1,d4
+.edgeLoop:
+	move.w	(a0)+,d0		; start_x
+	move.w	(a0)+,d1		; start_y
+	move.w	(a0)+,d2		; start_z
+	move.w	(a0)+,d3		; dx
+	move.w	(a0)+,d5		; dy
+	move.w	(a0)+,d6		; dz
+
+	moveq	#STARS_PER_EDGE-1,d7
+.starLoop:
+	move.w	d0,(a1)+		; target x
+	move.w	d1,(a1)+		; target y
+	move.w	d2,(a1)+		; target z
+	add.w	d3,d0			; x += dx
+	add.w	d5,d1			; y += dy
+	add.w	d6,d2			; z += dz
+	dbf	d7,.starLoop
+
+	dbf	d4,.edgeLoop
+	movem.l	(sp)+,d0-d7/a0-a1
+	rts
+
+;==========================================================
+; StartMorph — transition from tunnel to morph state
+;==========================================================
+StartMorph:
+	move.w	#EFFECT_MORPH,effect_state
+	clr.w	morph_counter
+	clr.w	angle_y
+	clr.w	angle_x
+	rts
+
+;==========================================================
+; MorphStars — ease stars toward cube targets, rotate, project
+; Uses exponential ease: pos += (target - pos) >> 3
+;==========================================================
+MorphStars:
+	movem.l	d2-d7/a2-a5,-(sp)
+
+	lea	BPLANE2,a0
+	lea	recip_table(pc),a3
+	lea	yoffset_table(pc),a4
+	lea	STAR_ARRAY,a2
+	lea	signed_sine_table(pc),a5
+
+	; Cache sin/cos for Y and X rotation on stack
+	move.w	angle_y(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d1		; sin_y
+	move.w	angle_y(pc),d0
+	add.w	#64,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d2		; cos_y
+
+	move.w	angle_x(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d3		; sin_x
+	move.w	angle_x(pc),d0
+	add.w	#64,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d4		; cos_x
+
+	; Push sin/cos values: sin_y, cos_y, sin_x, cos_x
+	move.w	d4,-(sp)		; cos_x [0(sp)]
+	move.w	d3,-(sp)		; sin_x [2(sp)]
+	move.w	d2,-(sp)		; cos_y [4(sp)]
+	move.w	d1,-(sp)		; sin_y [6(sp)]
+
+	lea	CUBE_TARGETS,a1
+
+	move.w	#NUM_STARS-1,d7
+
+.mstarLoop:
+	; ---- 1. Erase old pixel ----
+	move.w	STAR_OPX(a2),d0
+	cmp.w	#$FFFF,d0
+	beq.s	.mskipErase
+	move.w	STAR_OPY(a2),d1
+	add.w	d1,d1
+	move.w	0(a4,d1.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bclr	d2,0(a0,d4.w)
+.mskipErase:
+
+	; ---- 2. Ease toward target ----
+	; sx += (target_x - sx) >> 3
+	move.w	(a1),d0			; target_x
+	sub.w	STAR_SX(a2),d0
+	asr.w	#3,d0
+	add.w	d0,STAR_SX(a2)
+
+	move.w	2(a1),d0		; target_y
+	sub.w	STAR_SY(a2),d0
+	asr.w	#3,d0
+	add.w	d0,STAR_SY(a2)
+
+	move.w	4(a1),d0		; target_z
+	sub.w	STAR_SZ(a2),d0
+	asr.w	#3,d0
+	add.w	d0,STAR_SZ(a2)
+
+	; ---- 3. 3D rotate (Y then X) and project ----
+	move.w	STAR_SX(a2),d0		; x
+	move.w	STAR_SY(a2),d1		; y
+	move.w	STAR_SZ(a2),d2		; z
+
+	; Y rotation: x' = (x*cos_y + z*sin_y) >> 7
+	;             z' = (z*cos_y - x*sin_y) >> 7
+	move.w	d0,d3			; save x
+	move.w	d2,d4			; save z
+	muls	4(sp),d0		; x * cos_y
+	muls	6(sp),d4		; z * sin_y
+	add.l	d4,d0
+	asr.l	#7,d0			; d0 = x'
+	move.w	d2,d4			; z
+	muls	4(sp),d4		; z * cos_y
+	muls	6(sp),d3		; x * sin_y
+	sub.l	d3,d4
+	asr.l	#7,d4			; d4 = z'
+
+	; X rotation: y' = (y*cos_x - z'*sin_x) >> 7
+	;             z'' = (y*sin_x + z'*cos_x) >> 7
+	move.w	d1,d3			; save y
+	move.w	d4,d5			; save z'
+	muls	0(sp),d1		; y * cos_x
+	muls	2(sp),d5		; z' * sin_x
+	sub.l	d5,d1
+	asr.l	#7,d1			; d1 = y'
+	move.w	d3,d5			; y
+	muls	2(sp),d5		; y * sin_x
+	muls	0(sp),d4		; z' * cos_x
+	add.l	d5,d4
+	asr.l	#7,d4			; d4 = z''
+
+	; Add base Z for projection
+	add.w	#CUBE_BASE_Z,d4
+
+	; Project: recip lookup
+	cmp.w	#MIN_Z,d4
+	ble.w	.mskipPlot
+	cmp.w	#255,d4
+	ble.s	.mzOk
+	move.w	#255,d4
+.mzOk:
+	move.w	d4,d5
+	add.w	d5,d5
+	move.w	0(a3,d5.w),d5		; recip[z]
+
+	; screen_x = (x' * recip) >> 8 + CENTER_X
+	muls	d5,d0
+	asr.l	#8,d0
+	add.w	#CENTER_X,d0
+
+	; screen_y = (y' * recip) >> 8 + CENTER_Y
+	muls	d5,d1
+	asr.l	#8,d1
+	add.w	#CENTER_Y,d1
+
+	; Bounds check
+	tst.w	d0
+	blt.s	.mskipPlot
+	cmp.w	#383,d0
+	bgt.s	.mskipPlot
+	tst.w	d1
+	blt.s	.mskipPlot
+	cmp.w	#255,d1
+	bgt.s	.mskipPlot
+
+	; ---- 4. Plot pixel ----
+	move.w	d1,d4
+	add.w	d4,d4
+	move.w	0(a4,d4.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bset	d2,0(a0,d4.w)
+
+	move.w	d0,STAR_OPX(a2)
+	move.w	d1,STAR_OPY(a2)
+	bra.s	.mnextStar
+
+.mskipPlot:
+	move.w	#$FFFF,STAR_OPX(a2)
+
+.mnextStar:
+	lea	6(a1),a1		; next cube target
+	lea	STAR_SIZE(a2),a2
+	dbf	d7,.mstarLoop
+
+	; Clean up stack (4 words)
+	addq.l	#8,sp
+
+	; Advance angles
+	addq.w	#2,angle_y
+	and.w	#$FF,angle_y
+	addq.w	#1,angle_x
+	and.w	#$FF,angle_x
+
+	; Check morph completion
+	addq.w	#1,morph_counter
+	move.w	morph_counter(pc),d0
+	cmp.w	#MORPH_DURATION,d0
+	blt.s	.morphNotDone
+	move.w	#EFFECT_CUBE,effect_state
+.morphNotDone:
+
+	movem.l	(sp)+,d2-d7/a2-a5
+	rts
+
+;==========================================================
+; CubeStars — rotate cube targets, project, plot
+; Pure rotation mode (no easing, positions = cube targets)
+;==========================================================
+CubeStars:
+	movem.l	d2-d7/a2-a5,-(sp)
+
+	lea	BPLANE2,a0
+	lea	recip_table(pc),a3
+	lea	yoffset_table(pc),a4
+	lea	STAR_ARRAY,a2
+	lea	signed_sine_table(pc),a5
+
+	; Cache sin/cos for Y and X rotation on stack
+	move.w	angle_y(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d1		; sin_y
+	move.w	angle_y(pc),d0
+	add.w	#64,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d2		; cos_y
+
+	move.w	angle_x(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d3		; sin_x
+	move.w	angle_x(pc),d0
+	add.w	#64,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d4		; cos_x
+
+	; Push sin/cos: sin_y, cos_y, sin_x, cos_x
+	move.w	d4,-(sp)		; cos_x [0(sp)]
+	move.w	d3,-(sp)		; sin_x [2(sp)]
+	move.w	d2,-(sp)		; cos_y [4(sp)]
+	move.w	d1,-(sp)		; sin_y [6(sp)]
+
+	lea	CUBE_TARGETS,a1
+
+	move.w	#NUM_STARS-1,d7
+
+.cstarLoop:
+	; ---- 1. Erase old pixel ----
+	move.w	STAR_OPX(a2),d0
+	cmp.w	#$FFFF,d0
+	beq.s	.cskipErase
+	move.w	STAR_OPY(a2),d1
+	add.w	d1,d1
+	move.w	0(a4,d1.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bclr	d2,0(a0,d4.w)
+.cskipErase:
+
+	; ---- 2. Read cube target directly ----
+	move.w	(a1),d0			; x
+	move.w	2(a1),d1		; y
+	move.w	4(a1),d2		; z
+
+	; ---- 3. 3D rotate (Y then X) and project ----
+	; Y rotation
+	move.w	d0,d3
+	move.w	d2,d4
+	muls	4(sp),d0		; x * cos_y
+	muls	6(sp),d4		; z * sin_y
+	add.l	d4,d0
+	asr.l	#7,d0			; x'
+	move.w	d2,d4
+	muls	4(sp),d4		; z * cos_y
+	muls	6(sp),d3		; x * sin_y
+	sub.l	d3,d4
+	asr.l	#7,d4			; z'
+
+	; X rotation
+	move.w	d1,d3
+	move.w	d4,d5
+	muls	0(sp),d1		; y * cos_x
+	muls	2(sp),d5		; z' * sin_x
+	sub.l	d5,d1
+	asr.l	#7,d1			; y'
+	move.w	d3,d5
+	muls	2(sp),d5		; y * sin_x
+	muls	0(sp),d4		; z' * cos_x
+	add.l	d5,d4
+	asr.l	#7,d4			; z''
+
+	; Add base Z
+	add.w	#CUBE_BASE_Z,d4
+
+	; Project
+	cmp.w	#MIN_Z,d4
+	ble.w	.cskipPlot
+	cmp.w	#255,d4
+	ble.s	.czOk
+	move.w	#255,d4
+.czOk:
+	move.w	d4,d5
+	add.w	d5,d5
+	move.w	0(a3,d5.w),d5		; recip[z]
+
+	muls	d5,d0
+	asr.l	#8,d0
+	add.w	#CENTER_X,d0
+
+	muls	d5,d1
+	asr.l	#8,d1
+	add.w	#CENTER_Y,d1
+
+	; Bounds check
+	tst.w	d0
+	blt.s	.cskipPlot
+	cmp.w	#383,d0
+	bgt.s	.cskipPlot
+	tst.w	d1
+	blt.s	.cskipPlot
+	cmp.w	#255,d1
+	bgt.s	.cskipPlot
+
+	; ---- 4. Plot pixel ----
+	move.w	d1,d4
+	add.w	d4,d4
+	move.w	0(a4,d4.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bset	d2,0(a0,d4.w)
+
+	move.w	d0,STAR_OPX(a2)
+	move.w	d1,STAR_OPY(a2)
+	bra.s	.cnextStar
+
+.cskipPlot:
+	move.w	#$FFFF,STAR_OPX(a2)
+
+.cnextStar:
+	lea	6(a1),a1
+	lea	STAR_SIZE(a2),a2
+	dbf	d7,.cstarLoop
+
+	; Clean up stack
+	addq.l	#8,sp
+
+	; Advance angles
+	addq.w	#2,angle_y
+	and.w	#$FF,angle_y
+	addq.w	#1,angle_x
+	and.w	#$FF,angle_x
 
 	movem.l	(sp)+,d2-d7/a2-a5
 	rts
