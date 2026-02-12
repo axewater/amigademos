@@ -188,8 +188,8 @@ BuildCopper:
 
 	; COLOR01: white (logo text)
 	move.l	#(COLOR01<<16)|$0FFF,(a0)+
-	; COLOR02: light grey (stars)
-	move.l	#(COLOR02<<16)|$0999,(a0)+
+	; COLOR02: bright cyan (stars)
+	move.l	#(COLOR02<<16)|$0DFF,(a0)+
 	; COLOR03: bright white (overlap)
 	move.l	#(COLOR03<<16)|$0FFF,(a0)+
 
@@ -246,24 +246,29 @@ BuildCopper:
 	moveq	#0,d6
 	move.b	(a2,d0.w),d6		; d6 = sine value 0-63
 
-	; Convert sine value to pixel offset:
-	; sine_val is 0-63, center=32. Pixel offset = sine_val - 32 + center_offset
-	; The logo is drawn starting at byte offset 14 in the 48-byte line
-	; We want it roughly centered. BPL pointer offset in bytes = sine_val / 2
-	; (each byte = 8 pixels, so /2 gives word granularity = 16-pixel steps for coarse)
-	; Actually: coarse = sine_val >> 4 bytes offset (0-3), fine = sine_val & 15
+	; Horizontal scroll: shift display LEFT by sine_val pixels
+	; Adding to BPL1PT shifts LEFT (coarse, 16px steps)
+	; BPLCON1 shifts RIGHT (fine, 0-15px)
+	; To combine: invert fine scroll so both shift the same way
+	;   neg_fine = (-sine_val) & 15   (0 when aligned, else 16-fine)
+	;   coarse_bytes = ((sine_val + neg_fine) >> 4) * 2
+	;   BPLCON1 = neg_fine
+	moveq	#0,d7
+	sub.w	d6,d7
+	and.w	#15,d7			; d7 = neg_fine = BPLCON1 value
 
-	; Coarse scroll: byte offset added to base bitplane pointer
-	; Each line: base = BPLANE1 + line * BPWIDTH + coarse_byte_offset
-	move.w	d6,d7
-	lsr.w	#4,d7			; coarse: 0-3 (in units of 16 pixels)
-	add.w	d7,d7			; *2 for byte pairs (word-aligned for 16px)
+	move.w	d6,d0
+	add.w	d7,d0			; sine_val + neg_fine (rounds up to next 16)
+	lsr.w	#4,d0			; coarse_words
+	add.w	d0,d0			; coarse_bytes
 
+	; BPL1PT = BPLANE1 + line * BPWIDTH + coarse_bytes
+	move.w	d0,d6			; save coarse_bytes
 	move.w	d4,d0
 	mulu	#BPWIDTH,d0		; line * 48
 	add.l	#BPLANE1,d0
-	ext.l	d7
-	add.l	d7,d0			; add coarse offset
+	ext.l	d6
+	add.l	d6,d0			; add coarse offset
 
 	; BPL1PTH/PTL
 	move.w	#BPL1PTH,(a0)+
@@ -273,11 +278,9 @@ BuildCopper:
 	move.w	#BPL1PTL,(a0)+
 	move.w	d0,(a0)+
 
-	; Fine scroll: BPLCON1 bits 0-3 = fine scroll for bitplane 1
-	move.w	d6,d0
-	and.w	#$0F,d0			; fine: 0-15 pixels
+	; Fine scroll: BPLCON1 bits 0-3 (bitplane 1 only)
 	move.w	#BPLCON1,(a0)+
-	move.w	d0,(a0)+
+	move.w	d7,(a0)+		; neg_fine
 
 	; Next line
 	addq.w	#1,d4
@@ -292,42 +295,14 @@ BuildCopper:
 	rts
 
 ;==========================================================
-; DrawLogo — render "DEWDZKI-FXP" into bitplane 1 (48-byte wide)
-; Centered vertically at line 124, horizontally centered
+; DrawLogo — copy logo.bin bitmap into bitplane 1
 ;==========================================================
 DrawLogo:
-	lea	TextString(pc),a0
-	lea	Font8x8(pc),a1
-	lea	BPLANE1,a2
-
-	; Center: 11 chars * 8px = 88px
-	; In 384px wide plane: (384-88)/2 = 148 px -> byte 18, bit 4
-	; Simpler: byte 18 (pixel 144, close enough to center)
-	; Y: line 124
-	; Offset = 124 * 48 + 18 = 5970
-	add.w	#124*BPWIDTH+18,a2
-
-.nextChar:
-	moveq	#0,d0
-	move.b	(a0)+,d0
-	beq.s	.done
-
-	; Font index: (char - 32) * 8
-	sub.b	#32,d0
-	lsl.w	#3,d0
-	lea	(a1,d0.w),a3
-
-	; Draw 8 rows
-	move.l	a2,a4
-	moveq	#7,d1
-.drawRow:
-	move.b	(a3)+,(a4)
-	lea	BPWIDTH(a4),a4		; next line (48 bytes)
-	dbf	d1,.drawRow
-
-	addq.l	#1,a2			; next char column
-	bra.s	.nextChar
-.done:
+	lea	LogoBitmap(pc),a0
+	lea	BPLANE1,a1
+	move.w	#(BPSIZE/4)-1,d0
+.copy:	move.l	(a0)+,(a1)+
+	dbf	d0,.copy
 	rts
 
 ;==========================================================
@@ -465,9 +440,6 @@ DrawStar:
 ;==========================================================
 ; Data
 ;==========================================================
-TextString:
-	dc.b	"DEWDZKI-FXP",0
-	even
 
 ;==========================================================
 ; Star array: 80 * 6 bytes = 480 bytes
@@ -476,69 +448,11 @@ star_array:
 	dcb.b	NUM_STARS*STAR_SIZE,0
 
 ;==========================================================
-; 8x8 bitmap font: ASCII 32 (space) through ASCII 90 (Z)
+; Logo bitmap: 48 bytes/line * 256 lines = 12288 bytes
+; 1 bitplane, 384px wide, black & white
 ;==========================================================
-Font8x8:
-	; ASCII 32: SPACE
-	dc.b	$00,$00,$00,$00,$00,$00,$00,$00
-	; ASCII 33-44: unused
-	dcb.b	8*12,0
-	; ASCII 45: - (hyphen)
-	dc.b	$00,$00,$00,$7E,$00,$00,$00,$00
-	; ASCII 46-64: unused
-	dcb.b	8*19,0
-	; ASCII 65: A
-	dc.b	$18,$3C,$66,$66,$7E,$66,$66,$00
-	; ASCII 66: B
-	dc.b	$7C,$66,$66,$7C,$66,$66,$7C,$00
-	; ASCII 67: C
-	dc.b	$3C,$66,$60,$60,$60,$66,$3C,$00
-	; ASCII 68: D
-	dc.b	$7C,$66,$66,$66,$66,$66,$7C,$00
-	; ASCII 69: E
-	dc.b	$7E,$60,$60,$7C,$60,$60,$7E,$00
-	; ASCII 70: F
-	dc.b	$7E,$60,$60,$7C,$60,$60,$60,$00
-	; ASCII 71: G
-	dc.b	$3C,$66,$60,$6E,$66,$66,$3E,$00
-	; ASCII 72: H
-	dc.b	$66,$66,$66,$7E,$66,$66,$66,$00
-	; ASCII 73: I
-	dc.b	$3C,$18,$18,$18,$18,$18,$3C,$00
-	; ASCII 74: J
-	dc.b	$0E,$06,$06,$06,$06,$66,$3C,$00
-	; ASCII 75: K
-	dc.b	$66,$6C,$78,$70,$78,$6C,$66,$00
-	; ASCII 76: L
-	dc.b	$60,$60,$60,$60,$60,$60,$7E,$00
-	; ASCII 77: M
-	dc.b	$C6,$EE,$FE,$D6,$C6,$C6,$C6,$00
-	; ASCII 78: N
-	dc.b	$C6,$E6,$F6,$DE,$CE,$C6,$C6,$00
-	; ASCII 79: O
-	dc.b	$3C,$66,$66,$66,$66,$66,$3C,$00
-	; ASCII 80: P
-	dc.b	$7C,$66,$66,$7C,$60,$60,$60,$00
-	; ASCII 81: Q
-	dc.b	$3C,$66,$66,$66,$6A,$6C,$36,$00
-	; ASCII 82: R
-	dc.b	$7C,$66,$66,$7C,$6C,$66,$66,$00
-	; ASCII 83: S
-	dc.b	$3C,$66,$60,$3C,$06,$66,$3C,$00
-	; ASCII 84: T
-	dc.b	$7E,$18,$18,$18,$18,$18,$18,$00
-	; ASCII 85: U
-	dc.b	$66,$66,$66,$66,$66,$66,$3C,$00
-	; ASCII 86: V
-	dc.b	$66,$66,$66,$66,$66,$3C,$18,$00
-	; ASCII 87: W
-	dc.b	$C6,$C6,$C6,$D6,$D6,$FE,$6C,$00
-	; ASCII 88: X
-	dc.b	$66,$66,$3C,$18,$3C,$66,$66,$00
-	; ASCII 89: Y
-	dc.b	$66,$66,$66,$3C,$18,$18,$18,$00
-	; ASCII 90: Z
-	dc.b	$7E,$06,$0C,$18,$30,$60,$7E,$00
+LogoBitmap:
+	incbin	"logo.bin"
 
 ;==========================================================
 ; Generated tables (sine + gradient)

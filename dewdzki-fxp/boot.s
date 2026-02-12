@@ -5,7 +5,7 @@
 ;----------------------------------------------------------
 
 DEMO_ADDR	equ	$49000
-LOAD_SIZE	equ	8192		; generous fixed load size
+LOAD_SIZE	equ	16384		; must be >= demo.bin size (currently ~14 KB)
 STACK_ADDR	equ	$7FFF0
 CUSTOM		equ	$DFF000
 DMACON		equ	$096
