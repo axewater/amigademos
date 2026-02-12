@@ -5,7 +5,7 @@
 ;----------------------------------------------------------
 
 DEMO_ADDR	equ	$49000
-LOAD_SIZE	equ	24576		; must be >= demo.bin size
+LOAD_SIZE	equ	196608		; must be >= demo.bin size (~170KB with mod)
 STACK_ADDR	equ	$7FFF0
 CUSTOM		equ	$DFF000
 DMACON		equ	$096

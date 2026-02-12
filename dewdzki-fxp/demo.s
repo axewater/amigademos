@@ -56,6 +56,8 @@ VHPOSR		equ	$006
 DMACON		equ	$096
 INTENA		equ	$09A
 INTREQ		equ	$09C
+INTREQR		equ	$01E
+INTENAR		equ	$01C
 DIWSTRT		equ	$08E
 DIWSTOP		equ	$090
 DDFSTRT		equ	$092
@@ -130,6 +132,23 @@ Start:
 	; Init copper buffer pointers
 	move.l	#COPPER_A,cop_front
 	move.l	#COPPER_B,cop_back
+
+	; Install CIA-B interrupt for music playback
+	sub.l	a0,a0			; VectorBase = 0 (68000, no VBR)
+	moveq	#1,d0			; PAL flag
+	bsr	_mt_install_cia
+
+	; Init module
+	lea	moddata,a0		; absolute (too far for PC-relative)
+	sub.l	a1,a1			; samples embedded in module
+	moveq	#0,d0			; start at song position 0
+	bsr	_mt_init
+
+	; Enable playback (mt_init falls through to mt_end which clears this)
+	st	_mt_Enable		; set to $FF (non-zero = enabled)
+
+	; Enable master interrupt (CIA handler needs it)
+	move.w	#$C000,INTENA(a6)	; SET + INTEN
 
 ;==========================================================
 ; Main loop
@@ -947,3 +966,12 @@ LogoBitmap:
 	incbin	"logo.bin"
 
 	include	"tables.i"
+
+;==========================================================
+; MOD player and music data
+;==========================================================
+	include	"ptplayer_minimal.asm"
+
+	even
+moddata:
+	incbin	"music.mod"

@@ -15,7 +15,7 @@ $(TARGET): $(BOOTBIN) $(DEMOBIN) makeadf.py
 $(BOOTBIN): boot.s
 	$(ASM) $(AFLAGS) -o $(BOOTBIN) boot.s
 
-$(DEMOBIN): demo.s $(TABLES)
+$(DEMOBIN): demo.s $(TABLES) ptplayer_minimal.asm music.mod
 	$(ASM) $(AFLAGS) -o $(DEMOBIN) demo.s
 
 $(TABLES): gentables.py
