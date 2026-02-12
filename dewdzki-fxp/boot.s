@@ -1,10 +1,10 @@
 ;----------------------------------------------------------
 ; DEWDZKI-FXP Bootblock Trackloader
-; Loads demo code from disk offset 1024 into $49000
+; Loads demo code from disk offset 1024 into DEMO_ADDR
 ; Uses AmigaOS DoIO via Kickstart-provided IORequest
 ;----------------------------------------------------------
 
-DEMO_ADDR	equ	$46000
+DEMO_ADDR	equ	$49000
 LOAD_SIZE	equ	16384		; must be >= demo.bin size
 STACK_ADDR	equ	$7FFF0
 CUSTOM		equ	$DFF000
