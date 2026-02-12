@@ -1,15 +1,14 @@
 ;----------------------------------------------------------
 ; DEWDZKI-FXP Main Demo
-; Loaded at $49000 by bootblock trackloader
-; OCS A500 PAL — 2 bitplanes, 384px wide
-; Effects: copper raster bars, sine-wave logo, starfield
+; Loaded at $46000 by bootblock trackloader
+; OCS A500 PAL — 1 bitplane, 384px wide
+; Effects: copper raster bars, sine-wave logo
 ;----------------------------------------------------------
 
 ; Memory map (chip RAM)
 COPPER_A	equ	$40000		; copper list front buffer (6 KB)
 COPPER_B	equ	$41800		; copper list back buffer (6 KB)
 BPLANE1		equ	$43000		; bitplane 1: logo (48*256 = 12 KB)
-BPLANE2		equ	$46000		; bitplane 2: stars (48*256 = 12 KB)
 
 ; Display parameters
 BPWIDTH		equ	48		; bytes per line (384 pixels)
@@ -31,24 +30,15 @@ BPLCON0		equ	$100
 BPLCON1		equ	$102
 BPLCON2		equ	$104
 BPL1MOD		equ	$108
-BPL2MOD		equ	$10A
 BPL1PTH		equ	$0E0
 BPL1PTL		equ	$0E2
-BPL2PTH		equ	$0E4
-BPL2PTL		equ	$0E6
 COLOR00		equ	$180
 COLOR01		equ	$182
-COLOR02		equ	$184
-COLOR03		equ	$186
 COP1LCH		equ	$080
 COP1LCL		equ	$082
 COPJMP1		equ	$088
 
-; Star parameters
-NUM_STARS	equ	80
-STAR_SIZE	equ	6		; x(word) + y(word) + speed(word)
-
-	org	$49000			; loaded here by bootblock
+	org	$46000			; loaded here by bootblock
 
 ;==========================================================
 ; Entry point — jumped to from bootblock
@@ -63,17 +53,8 @@ Start:
 .clr1:	clr.l	(a0)+
 	dbf	d0,.clr1
 
-	; Clear bitplane 2 (stars)
-	lea	BPLANE2,a0
-	move.w	#(BPSIZE/4)-1,d0
-.clr2:	clr.l	(a0)+
-	dbf	d0,.clr2
-
 	; Draw logo text into bitplane 1
 	bsr.w	DrawLogo
-
-	; Init star array with LFSR
-	bsr.w	InitStars
 
 	; Build initial copper list in buffer A
 	lea	COPPER_A,a0
@@ -113,9 +94,6 @@ MainLoop:
 	; Build next frame into back buffer
 	move.l	cop_back(pc),a0
 	bsr.w	BuildCopper
-
-	; Update starfield
-	bsr.w	UpdateStars
 
 	; Advance animation phases
 	addq.w	#1,gradient_phase
@@ -163,35 +141,19 @@ BuildCopper:
 	move.l	#(DDFSTRT<<16)|$0030,(a0)+
 	; DDFSTOP $00D0
 	move.l	#(DDFSTOP<<16)|$00D0,(a0)+
-	; BPLCON0: 2 bitplanes, color
-	move.l	#(BPLCON0<<16)|$2200,(a0)+
+	; BPLCON0: 1 bitplane, color
+	move.l	#(BPLCON0<<16)|$1200,(a0)+
 	; BPLCON1: 0 (will be set per-line)
 	move.l	#(BPLCON1<<16)|$0000,(a0)+
 	; BPLCON2: 0
 	move.l	#(BPLCON2<<16)|$0000,(a0)+
-	; BPL1MOD: extra fetch = 48 - 42 = 6 (384px fetch is 24 words = 48 bytes,
-	;   but display window fetches ~21 words; modulo compensates)
+	; BPL1MOD: extra fetch = 48 - 42 = 6
 	; With DDFSTRT=$0030, DDFSTOP=$00D0: fetches (D0-30)/8+1 = 21 words = 42 bytes
 	; We want 48-byte lines, so modulo = 48 - 42 = 6
 	move.l	#(BPL1MOD<<16)|6,(a0)+
-	; BPL2MOD: same
-	move.l	#(BPL2MOD<<16)|6,(a0)+
 
-	; BPL2PTH/PTL — stars bitplane (constant, not per-line)
-	move.l	#BPLANE2,d0
-	move.w	#BPL2PTH,(a0)+
-	swap	d0
-	move.w	d0,(a0)+
-	swap	d0
-	move.w	#BPL2PTL,(a0)+
-	move.w	d0,(a0)+
-
-	; COLOR01: white (logo text)
-	move.l	#(COLOR01<<16)|$0FFF,(a0)+
-	; COLOR02: bright cyan (stars)
-	move.l	#(COLOR02<<16)|$0DFF,(a0)+
-	; COLOR03: bright white (overlap)
-	move.l	#(COLOR03<<16)|$0FFF,(a0)+
+	; COLOR00: black background
+	move.l	#(COLOR00<<16)|$0000,(a0)+
 
 	; --- Per-scanline copper instructions ---
 	; For each of 256 lines:
@@ -230,12 +192,13 @@ BuildCopper:
 	move.w	#$FFFE,(a0)+		; WAIT mask
 
 .doColor:
-	; COLOR00 = gradient[(line + gradient_phase) & 255]
+	; COLOR01 = gradient[(line + gradient_phase) & 255]
+	; Logo pixels cycle through the gradient colors
 	move.w	d4,d0
 	add.w	d2,d0
 	and.w	#$FF,d0
 	add.w	d0,d0			; *2 for word index
-	move.w	#COLOR00,(a0)+
+	move.w	#COLOR01,(a0)+
 	move.w	(a3,d0.w),(a0)+
 
 	; Compute sine-based bitplane pointer offset
@@ -306,146 +269,8 @@ DrawLogo:
 	rts
 
 ;==========================================================
-; InitStars — initialize 80 stars with LFSR random positions
-;==========================================================
-InitStars:
-	lea	star_array(pc),a0
-	move.w	#$ACE1,d0		; LFSR seed
-	moveq	#NUM_STARS-1,d1
-
-.initStar:
-	; Generate random X (0-383)
-	bsr.s	.lfsr_step
-	and.w	#$01FF,d0		; 0-511
-	cmp.w	#384,d0
-	blt.s	.xok
-	sub.w	#384,d0
-.xok:	move.w	d0,(a0)+		; x
-
-	; Generate random Y (0-255)
-	bsr.s	.lfsr_step
-	and.w	#$FF,d0
-	move.w	d0,(a0)+		; y
-
-	; Speed based on star index: 0-29=1, 30-59=2, 60-79=3
-	moveq	#NUM_STARS-1,d2
-	sub.w	d1,d2			; d2 = star index (0-based)
-	cmp.w	#30,d2
-	blt.s	.speed1
-	cmp.w	#60,d2
-	blt.s	.speed2
-	move.w	#3,(a0)+
-	bra.s	.speedDone
-.speed2:
-	move.w	#2,(a0)+
-	bra.s	.speedDone
-.speed1:
-	move.w	#1,(a0)+
-.speedDone:
-	dbf	d1,.initStar
-	move.w	d0,lfsr_state		; save LFSR state
-	rts
-
-	; 16-bit Galois LFSR step (taps: 16,14,13,11 = $B400)
-.lfsr_step:
-	move.w	d0,d2
-	and.w	#1,d2
-	beq.s	.no_tap
-	eor.w	#$B400,d0
-.no_tap:
-	lsr.w	#1,d0
-	or.w	d2,d0			; rotate feedback bit if needed
-	rts
-
-lfsr_state:	dc.w	$ACE1
-
-;==========================================================
-; UpdateStars — erase old, move, draw new
-;==========================================================
-UpdateStars:
-	movem.l	d2-d5/a2,-(sp)
-	lea	star_array(pc),a2
-	moveq	#NUM_STARS-1,d4
-
-.starLoop:
-	move.w	(a2),d0			; x
-	move.w	2(a2),d1		; y
-	move.w	4(a2),d2		; speed
-
-	; Erase old pixel
-	bsr.s	EraseStar
-
-	; Move star left
-	sub.w	d2,d0
-	bpl.s	.noWrap
-	add.w	#384,d0			; wrap around
-.noWrap:
-	move.w	d0,(a2)			; store new x
-
-	; Draw new pixel
-	move.w	(a2),d0
-	move.w	2(a2),d1
-	bsr.s	DrawStar
-
-	lea	STAR_SIZE(a2),a2
-	dbf	d4,.starLoop
-
-	movem.l	(sp)+,d2-d5/a2
-	rts
-
-;----------------------------------------------------------
-; EraseStar — clear pixel at (d0=x, d1=y) in bitplane 2
-;----------------------------------------------------------
-EraseStar:
-	movem.l	d0-d1/a0,-(sp)
-	lea	BPLANE2,a0
-
-	; byte offset = y * 48 + x / 8
-	mulu	#BPWIDTH,d1
-	move.w	d0,d3
-	lsr.w	#3,d3
-	ext.l	d3
-	add.l	d1,d3
-	add.l	d3,a0
-
-	; bit number = 7 - (x & 7)
-	not.w	d0
-	and.w	#7,d0
-	bclr	d0,(a0)
-
-	movem.l	(sp)+,d0-d1/a0
-	rts
-
-;----------------------------------------------------------
-; DrawStar — set pixel at (d0=x, d1=y) in bitplane 2
-;----------------------------------------------------------
-DrawStar:
-	movem.l	d0-d1/a0,-(sp)
-	lea	BPLANE2,a0
-
-	mulu	#BPWIDTH,d1
-	move.w	d0,d3
-	lsr.w	#3,d3
-	ext.l	d3
-	add.l	d1,d3
-	add.l	d3,a0
-
-	not.w	d0
-	and.w	#7,d0
-	bset	d0,(a0)
-
-	movem.l	(sp)+,d0-d1/a0
-	rts
-
-;==========================================================
 ; Data
 ;==========================================================
-
-;==========================================================
-; Star array: 80 * 6 bytes = 480 bytes
-;==========================================================
-star_array:
-	dcb.b	NUM_STARS*STAR_SIZE,0
 
 ;==========================================================
 ; Logo bitmap: 48 bytes/line * 256 lines = 12288 bytes
