@@ -151,6 +151,12 @@ NULL_IS_CLEARED	equ	0
 ENABLE_VUMETER	equ	0
 	endc
 
+; Enable song-end detection in MINIMAL mode.
+; When enabled, _mt_SongEnd increments each time the song loops.
+	ifnd	ENABLE_SONGEND
+ENABLE_SONGEND	equ	0
+	endc
+
 ; Delay in CIA-ticks, which guarantees that at least one Audio-DMA
 ; took place, even with the lowest periods.
 ; 496 should be the correct value. But there are some A1200 which
@@ -722,6 +728,9 @@ mt_reset:
 	ifeq	MINIMAL
 	clr.b	mt_SongEnd(a4)
 	clr.b	mt_SilCntValid(a4)
+	endc
+	ifne	ENABLE_SONGEND*MINIMAL
+	clr.b	mt_SongEnd(a4)
 	endc
 
 	move.l	(sp)+,a4
@@ -1389,6 +1398,10 @@ song_step:
 	bne	.2
 	clr.b	mt_Enable(a4)		; stop the song when mt_SongEnd was -1
 .2:	and.b	#$7f,mt_SongEnd(a4)
+	endc
+	ifne	ENABLE_SONGEND*MINIMAL
+	addq.b	#1,mt_SongEnd(a4)
+	and.b	#$7f,mt_SongEnd(a4)
 	endc
 .1:	move.b	d0,mt_SongPos(a4)
 
@@ -3166,6 +3179,9 @@ mt_E8Trigger	rs.b	1		; exported as _mt_E8Trigger
 mt_MusicChannels rs.b	1		; exported as _mt_MusicChannels
 mt_SongEnd	rs.b	1		; exported as _mt_SongEnd
 	endc	; !MINIMAL
+	ifne	ENABLE_SONGEND*MINIMAL
+mt_SongEnd	rs.b	1		; exported as _mt_SongEnd
+	endc
 	ifne	ENABLE_VUMETER
 mt_VUMeter	rs.b	1		; exported as _mt_VUMeter
 	endc	;ENABLE_VUMETER
@@ -3188,6 +3204,11 @@ _mt_MusicChannels:
 _mt_SongEnd:
 	ds.b	1
 	endc	; !MINIMAL
+	ifne	ENABLE_SONGEND*MINIMAL
+	xdef	_mt_SongEnd
+_mt_SongEnd:
+	ds.b	1
+	endc
 
 	ifne	ENABLE_VUMETER
 	xdef	_mt_VUMeter

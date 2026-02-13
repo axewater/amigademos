@@ -441,7 +441,71 @@ MainLoop:
 	move.w	d0,flash_timer
 .noFlashDec:
 
+	; --- Check for demo end ---
+	tst.b	_mt_SongEnd		; song looped?
+	bne.w	EndDemo
+	btst	#6,$BFE001		; left mouse button (active low)
+	beq.w	EndDemo
+
 	bra.w	MainLoop
+
+;==========================================================
+; EndDemo — fade to black and halt
+;==========================================================
+EndDemo:
+	; Stop music
+	bsr	_mt_end
+
+	; Fade out over 16 frames
+	moveq	#15,d7
+.fadeLoop:
+	bsr.w	WaitVBL
+	move.l	cop_front(pc),a0
+	bsr.w	FadeCopper
+	move.l	cop_back(pc),a0
+	bsr.w	FadeCopper
+	dbf	d7,.fadeLoop
+
+	; Kill everything
+	move.w	#$7FFF,INTENA(a6)
+	move.w	#$7FFF,INTREQ(a6)
+	move.w	#$7FFF,DMACON(a6)
+	move.w	#$0000,COLOR00(a6)
+
+.halt:	bra.s	.halt
+
+;==========================================================
+; FadeCopper — decrement all color register values in copper list
+; a0 = copper list pointer, a6 = CUSTOM base
+;==========================================================
+FadeCopper:
+.scan:	move.w	(a0)+,d0		; register
+	move.w	(a0)+,d1		; value
+	cmp.w	#$FFFF,d0		; end of copper list?
+	beq.s	.fdone
+	btst	#0,d1			; WAIT instruction? (bit 0 of 2nd word)
+	bne.s	.scan
+	; Check if this is a color register ($0180-$01BE)
+	cmp.w	#$0180,d0
+	blt.s	.scan
+	cmp.w	#$01BE,d0
+	bgt.s	.scan
+	; Fade: decrement each RGB nibble toward 0
+	move.w	d1,d2
+	and.w	#$0F00,d2
+	beq.s	.rOk
+	sub.w	#$0100,d1
+.rOk:	move.w	d1,d2
+	and.w	#$00F0,d2
+	beq.s	.gOk
+	sub.w	#$0010,d1
+.gOk:	move.w	d1,d2
+	and.w	#$000F,d2
+	beq.s	.bOk
+	subq.w	#1,d1
+.bOk:	move.w	d1,-2(a0)		; write back faded value
+	bra.s	.scan
+.fdone:	rts
 
 ;==========================================================
 ; Variables
@@ -2287,6 +2351,7 @@ scroll_text:
 ; MOD player
 ;==========================================================
 ENABLE_VUMETER	equ	1
+ENABLE_SONGEND	equ	1
 	include	"ptplayer_minimal.asm"
 
 	even

@@ -102,6 +102,17 @@ COP1LCH		equ	$080
 COP1LCL		equ	$082
 COPJMP1		equ	$088
 
+; Disk trackloader constants
+LOADER_ADDR	equ	$38000		; safe RAM for relocated trackloader
+MFM_BUF		equ	$40000		; raw MFM read buffer (reuses bitplane area)
+MFM_WORDS	equ	6600		; words to DMA per track (~13.2KB)
+DEST_ADDR	equ	$49000		; Part 2 load address
+CIAB_PRA	equ	$BFD100		; CIA-B port A (drive control)
+CIAA_PRA	equ	$BFE001		; CIA-A port A (mouse/TK0)
+SYNC_WORD	equ	$4489		; MFM sync marker
+PART2_START_TRACK equ	32		; track-side index for Part 2 on disk
+PART2_NUM_TRACKS  equ	29		; ceil(159262 / 5632) = 29
+
 	org	$49000			; loaded here by bootblock
 
 ;==========================================================
@@ -247,7 +258,379 @@ MainLoop:
 	addq.w	#3,terrain_phase2
 	and.w	#$FF,terrain_phase2
 
+	; --- Check for Part 2 transition ---
+	tst.b	_mt_SongEnd		; song looped?
+	bne.w	TransitionToPart2
+	btst	#6,CIAA_PRA		; left mouse button (active low)
+	beq.w	TransitionToPart2
+
 	bra.w	MainLoop
+
+;==========================================================
+; TransitionToPart2 — fade out, load Part 2 from disk, jump
+;==========================================================
+TransitionToPart2:
+	; Stop music
+	bsr	_mt_end
+
+	; Fade out over 16 frames
+	moveq	#15,d7
+.fadeLoop:
+	bsr.w	WaitVBL
+	move.l	cop_front(pc),a0
+	bsr.w	FadeCopper
+	move.l	cop_back(pc),a0
+	bsr.w	FadeCopper
+	dbf	d7,.fadeLoop
+
+	; Kill everything
+	move.w	#$7FFF,INTENA(a6)
+	move.w	#$7FFF,INTREQ(a6)
+	move.w	#$7FFF,DMACON(a6)
+	move.w	#$0000,COLOR00(a6)
+
+	; Copy trackloader to safe RAM at LOADER_ADDR ($38000)
+	lea	TrackloaderCode(pc),a0
+	lea	LOADER_ADDR,a1
+	move.w	#(TrackloaderEnd-TrackloaderCode+3)/4-1,d0
+.copyLdr:
+	move.l	(a0)+,(a1)+
+	dbf	d0,.copyLdr
+
+	; Jump to relocated trackloader
+	jmp	LOADER_ADDR
+
+;==========================================================
+; FadeCopper — decrement all color register values in copper list
+; a0 = copper list pointer
+;==========================================================
+FadeCopper:
+.scan:	move.w	(a0)+,d0		; register
+	move.w	(a0)+,d1		; value
+	cmp.w	#$FFFF,d0		; end of copper list?
+	beq.s	.fdone
+	btst	#0,d1			; WAIT instruction? (bit 0 of 2nd word)
+	bne.s	.scan
+	; Check if color register ($0180-$01BE)
+	cmp.w	#$0180,d0
+	blt.s	.scan
+	cmp.w	#$01BE,d0
+	bgt.s	.scan
+	; Fade: decrement each RGB nibble toward 0
+	move.w	d1,d2
+	and.w	#$0F00,d2
+	beq.s	.rOk
+	sub.w	#$0100,d1
+.rOk:	move.w	d1,d2
+	and.w	#$00F0,d2
+	beq.s	.gOk
+	sub.w	#$0010,d1
+.gOk:	move.w	d1,d2
+	and.w	#$000F,d2
+	beq.s	.bOk
+	subq.w	#1,d1
+.bOk:	move.w	d1,-2(a0)		; write back faded value
+	bra.s	.scan
+.fdone:	rts
+
+;==========================================================
+; Hardware trackloader — reads Part 2 from disk via MFM DMA
+; Assembled inline, copied to LOADER_ADDR ($38000) at runtime.
+; All branches are PC-relative. Hardware addresses are absolute.
+;==========================================================
+; Register allocation for trackloader:
+;   d5 = current cylinder (preserved across all subroutines)
+;   d6 = tracks remaining (read loop)
+;   d7 = current track-side index (read loop)
+;   a5 = destination pointer (read loop)
+;   a6 = $DFF000 (preserved throughout)
+;   d0-d4, d1 = scratch (may be clobbered by any subroutine)
+
+TrackloaderCode:
+	lea	$DFF000,a6
+
+	; DEBUG: red = trackloader entered
+	move.w	#$F00,$180(a6)
+
+	; --- Select drive 0, motor on ---
+	move.b	CIAB_PRA,d0
+	and.b	#$77,d0			; /MTR=0 (motor on), /SEL0=0 (select DF0:)
+	or.b	#$70,d0			; /SEL1,2,3=1 (deselect others)
+	move.b	d0,CIAB_PRA
+
+	; Wait for motor spin-up (~500ms = 25 VBlanks)
+	moveq	#25,d4			; d4 = VBL counter (not clobbered by waitVBL)
+.motorWait:
+	bsr.w	.waitVBL
+	dbf	d4,.motorWait
+
+	; DEBUG: orange = motor ready
+	move.w	#$F80,$180(a6)
+
+	; --- Seek to track 0 ---
+	bsr.w	.seekTrack0
+
+	; DEBUG: yellow = at track 0
+	move.w	#$FF0,$180(a6)
+
+	; --- Seek to starting cylinder ---
+	move.w	#PART2_START_TRACK/2,d3	; d3 = target cylinder
+	bsr.w	.seekCylinder
+
+	; DEBUG: green = seeked to target cylinder
+	move.w	#$0F0,$180(a6)
+
+	; --- Read loop ---
+	move.w	#PART2_START_TRACK,d7	; d7 = current track-side index
+	move.w	#PART2_NUM_TRACKS,d6	; d6 = tracks remaining
+	move.l	#DEST_ADDR,a5		; a5 = destination pointer (absolute, not PC-relative!)
+
+.readLoop:
+	; DEBUG: cyan = about to read a track
+	move.w	#$0FF,$180(a6)
+
+	; Select side: track-side bit 0 = side
+	move.b	CIAB_PRA,d0
+	btst	#0,d7
+	bne.s	.side1
+	or.b	#$04,d0			; /SIDE=1 → upper head (side 0)
+	bra.s	.sideSet
+.side1:	and.b	#$FB,d0			; /SIDE=0 → lower head (side 1)
+.sideSet:
+	move.b	d0,CIAB_PRA
+
+	; Small settle delay after side select
+	move.w	#500,d0
+.sideDly:
+	dbf	d0,.sideDly
+
+	; DEBUG: blue = about to start DMA read
+	move.w	#$00F,$180(a6)
+
+	; Read one track of raw MFM data
+	bsr.w	.readTrackMFM
+
+	; DEBUG: magenta = DMA read complete
+	move.w	#$F0F,$180(a6)
+
+	; Decode all 11 sectors to destination
+	bsr.w	.decodeTrack
+
+	; Next track-side
+	addq.w	#1,d7
+	subq.w	#1,d6
+	beq.s	.loadDone
+
+	; If crossed to new cylinder (d7 went from odd to even), step inward
+	btst	#0,d7
+	bne.s	.readLoop		; still on side 1, same cylinder
+	bsr.w	.stepIn
+	bra.s	.readLoop
+
+.loadDone:
+	; DEBUG: white = load complete, about to jump
+	move.w	#$FFF,$180(a6)
+
+	; Deselect drive, motor off
+	move.b	CIAB_PRA,d0
+	or.b	#$F8,d0			; /MTR=1, /SEL0..3=1
+	move.b	d0,CIAB_PRA
+
+	; Jump to Part 2 (force absolute — jmp DEST_ADDR gets PC-relative
+	; optimized by vasm, which breaks after relocation to $38000!)
+	lea	$7FFF0,a7		; reset stack
+	move.l	#DEST_ADDR,a0		; absolute target address
+	jmp	(a0)			; register indirect — no PC-relative!
+
+; --- Wait for vertical blank (clobbers d0 only) ---
+.waitVBL:
+.wv1:	move.l	$004(a6),d0		; VPOSR
+	and.l	#$1FF00,d0
+	cmp.l	#300<<8,d0
+	bne.s	.wv1
+.wv2:	move.l	$004(a6),d0
+	and.l	#$1FF00,d0
+	cmp.l	#300<<8,d0
+	beq.s	.wv2
+	rts
+
+; --- Seek to track 0 (clobbers d0,d1) ---
+.seekTrack0:
+	move.b	CIAB_PRA,d0
+	or.b	#$02,d0			; DIR=1 (outward)
+	move.b	d0,CIAB_PRA
+.st0Loop:
+	btst	#4,CIAA_PRA		; /TK0 (active low)
+	beq.s	.st0Done
+	bsr.w	.stepPulse
+	bra.s	.st0Loop
+.st0Done:
+	clr.w	d5			; d5 = current cylinder = 0
+	rts
+
+; --- Seek to cylinder d3 from current cylinder d5 (clobbers d0,d1) ---
+.seekCylinder:
+	cmp.w	d5,d3
+	beq.s	.seekDone
+	bgt.s	.seekFwd
+	; Seek outward
+	move.b	CIAB_PRA,d0
+	or.b	#$02,d0			; DIR=1 (outward)
+	move.b	d0,CIAB_PRA
+.seekOutLoop:
+	bsr.w	.stepPulse
+	subq.w	#1,d5
+	cmp.w	d5,d3
+	blt.s	.seekOutLoop
+	bra.s	.seekDone
+.seekFwd:
+	move.b	CIAB_PRA,d0
+	and.b	#$FD,d0			; DIR=0 (inward)
+	move.b	d0,CIAB_PRA
+.seekInLoop:
+	bsr.w	.stepPulse
+	addq.w	#1,d5
+	cmp.w	d5,d3
+	bgt.s	.seekInLoop
+.seekDone:
+	rts
+
+; --- Step one cylinder inward (clobbers d0,d1) ---
+.stepIn:
+	move.b	CIAB_PRA,d0
+	and.b	#$FD,d0			; DIR=0 (inward)
+	move.b	d0,CIAB_PRA
+	bsr.w	.stepPulse
+	addq.w	#1,d5
+	rts
+
+; --- Step pulse with settle delay (clobbers d0,d1) ---
+.stepPulse:
+	move.b	CIAB_PRA,d0
+	and.b	#$FE,d0			; /STEP = 0 (active)
+	move.b	d0,CIAB_PRA
+	move.w	#100,d1
+.spDly1:
+	dbf	d1,.spDly1
+	or.b	#$01,d0			; /STEP = 1 (inactive)
+	move.b	d0,CIAB_PRA
+	; Settle delay (~3ms)
+	move.w	#3000,d1
+.spDly2:
+	dbf	d1,.spDly2
+	rts
+
+; --- Read one track of raw MFM into MFM_BUF ---
+.readTrackMFM:
+	; Disable disk DMA
+	move.w	#$4000,$024(a6)		; DSKLEN: clear DMAEN
+	; Set up sync and encoding
+	move.w	#SYNC_WORD,$07E(a6)	; DSKSYNC
+	move.w	#$7F00,$09E(a6)		; ADKCON: clear disk bits
+	move.w	#$9500,$09E(a6)		; ADKCON: set PRECOMP+WORDSYNC+MFMPREC
+	; Set DMA pointer
+	move.l	#MFM_BUF,$020(a6)	; DSKPTH/L
+	; Clear disk interrupt flag
+	move.w	#$0002,$09C(a6)		; INTREQ: clear DSKBLK
+	; Enable disk DMA
+	move.w	#$8210,$096(a6)		; DMACON: set DSKEN+DMAEN
+	; Start read (must write DSKLEN twice)
+	move.w	#$8000|MFM_WORDS,d0
+	move.w	d0,$024(a6)		; DSKLEN
+	move.w	d0,$024(a6)		; DSKLEN (confirm)
+	; Wait for DSKBLK
+.waitDsk:
+	move.w	$01E(a6),d0		; INTREQR
+	btst	#1,d0			; DSKBLK?
+	beq.s	.waitDsk
+	; Stop disk DMA
+	move.w	#$4000,$024(a6)		; DSKLEN: clear DMAEN
+	move.w	#$0010,$096(a6)		; DMACON: clear DSKEN
+	move.w	#$0002,$09C(a6)		; INTREQ: clear DSKBLK
+	rts
+
+; --- Decode one track (11 sectors) from MFM_BUF to (a5)+ ---
+; AmigaDOS MFM sector format after $4489 sync:
+;   Header info: 2 longs (odd/even) = format,track,sector,toGap
+;   Sector label: 8 longs (odd/even) = 16 bytes (usually zeros)
+;   Header checksum: 2 longs (odd/even)
+;   Data checksum: 2 longs (odd/even)
+;   Data: 256 longs (128 odd + 128 even) = 512 decoded bytes
+.decodeTrack:
+	movem.l	d2-d5/a2-a4,-(sp)
+	moveq	#0,d4			; d4 = sectors decoded count
+	move.l	#MFM_BUF,a3		; a3 = scan pointer (absolute!)
+	move.l	#MFM_BUF+MFM_WORDS*2,a4 ; a4 = end of buffer (absolute!)
+
+.findSync:
+	cmp.l	a4,a3
+	bge.s	.trackDone
+	cmp.w	#SYNC_WORD,(a3)+
+	bne.s	.findSync
+	; Skip extra sync words
+.skipSync:
+	cmp.l	a4,a3
+	bge.s	.trackDone
+	cmp.w	#SYNC_WORD,(a3)
+	bne.s	.syncDone
+	addq.l	#2,a3
+	bra.s	.skipSync
+.syncDone:
+	; a3 points to MFM header info (2 longs: odd bits, even bits)
+	; Decode header to get sector number
+	move.l	(a3),d0			; odd bits
+	and.l	#$55555555,d0
+	lsl.l	#1,d0
+	move.l	4(a3),d1		; even bits
+	and.l	#$55555555,d1
+	or.l	d1,d0			; d0 = $FF.TT.SS.GG
+	; Extract sector number (bits 8-15)
+	move.l	d0,d2
+	lsr.w	#8,d2
+	and.w	#$00FF,d2		; d2 = sector number (0-10)
+
+	; Skip to data area:
+	;   Header info: 2 longs = 8 bytes
+	;   Sector label: 8 longs = 32 bytes
+	;   Header checksum: 2 longs = 8 bytes
+	;   Data checksum: 2 longs = 8 bytes
+	;   Total: 56 bytes from header start
+	lea	56(a3),a2		; a2 = MFM data (odd longs)
+
+	; Calculate destination: a5 + sector_number * 512
+	move.w	d2,d0
+	asl.w	#8,d0			; *256
+	add.w	d0,d0			; *512
+	lea	0(a5,d0.w),a0		; a0 = dest for this sector
+
+	; Decode 128 longwords: odd at (a2), even at 512(a2)
+	lea	512(a2),a1		; a1 = even data
+	moveq	#127,d3
+.decodeLong:
+	move.l	(a2)+,d0		; odd MFM
+	and.l	#$55555555,d0
+	lsl.l	#1,d0
+	move.l	(a1)+,d1		; even MFM
+	and.l	#$55555555,d1
+	or.l	d1,d0
+	move.l	d0,(a0)+
+	dbf	d3,.decodeLong
+
+	; Advance scan past this sector's data
+	; a1 already points past the even block (data_end) after the decode loop
+	move.l	a1,a3			; a3 = past sector data, resume scanning
+
+	addq.w	#1,d4
+	cmp.w	#11,d4			; all 11 sectors?
+	blt.s	.findSync
+
+.trackDone:
+	; Advance destination by one full track (11 * 512 = 5632)
+	lea	11*512(a5),a5
+	movem.l	(sp)+,d2-d5/a2-a4
+	rts
+
+TrackloaderEnd:
 
 ;==========================================================
 ; Variables
@@ -1173,6 +1556,7 @@ LogoBitmap:
 ;==========================================================
 ; MOD player and music data
 ;==========================================================
+ENABLE_SONGEND	equ	1
 	include	"ptplayer_minimal.asm"
 
 	even
