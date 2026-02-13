@@ -4,14 +4,16 @@ import random
 import sys
 
 def gen_sine_table():
-    """256-byte sine table, values 0-63 (center 32, amplitude ±31)."""
-    lines = ["; Sine table: 256 bytes, values 0-63"]
+    """256-byte sine table, values 0-48 (max coarse scroll offset = 6 bytes).
+    With 21-word DMA fetch (42 bytes) and 48-byte lines, coarse offset must be <= 6.
+    Values 49+ would cause DMA to read past the end of each scanline."""
+    lines = ["; Sine table: 256 bytes, values 0-48"]
     lines.append("sine_table:")
     for i in range(0, 256, 16):
         vals = []
         for j in range(16):
-            v = int(32 + 31 * math.sin(2 * math.pi * (i + j) / 256))
-            v = max(0, min(63, v))
+            v = int(24 + 24 * math.sin(2 * math.pi * (i + j) / 256))
+            v = max(0, min(48, v))
             vals.append(f"${v:02X}")
         lines.append(f"\tdc.b\t{','.join(vals)}")
     return "\n".join(lines)

@@ -19,6 +19,14 @@ BPWIDTH		equ	48		; bytes per line (384 pixels)
 BPHEIGHT	equ	256		; lines
 BPSIZE		equ	BPWIDTH*BPHEIGHT
 
+; Display register values
+DIWSTRT_VAL	equ	$2C81
+DIWSTOP_VAL	equ	$2CC1
+DDFSTRT_VAL	equ	$0030
+DDFSTOP_VAL	equ	$00D0
+BPLCON0_VAL	equ	$2200		; 2 bitplanes, color on
+BPL_MODULO	equ	BPWIDTH-42	; 48 - 21 words fetched = 6
+
 ; Star constants
 NUM_STARS	equ	120
 STAR_SIZE	equ	10		; bytes per star entry
@@ -115,8 +123,10 @@ Start:
 	clr.w	angle_y
 	clr.w	angle_x
 
-	; Build initial copper list in buffer A
+	; Build initial copper lists in both buffers
 	lea	COPPER_A,a0
+	bsr.w	BuildCopper
+	lea	COPPER_B,a0
 	bsr.w	BuildCopper
 
 	; Install copper list A
@@ -187,10 +197,10 @@ MainLoop:
 	bra.s	.stateEnd
 
 .doMorph:
-	bsr.w	MorphStars
+	bsr.w	ShapeStars
 	bra.s	.stateEnd
 .doDisplay:
-	bsr.w	DisplayShape
+	bsr.w	ShapeStars
 	addq.w	#1,display_timer
 	move.w	display_timer(pc),d0
 	cmp.w	#SHAPE_DISPLAY_TIME,d0
@@ -235,6 +245,10 @@ active_channel:	dc.w	0		; which MOD channel to track (0-3)
 channel_vol_off: dc.w	mt_chan1+n_volume ; precomputed offset into mt_data
 last_rawkey:	dc.b	0		; last raw keyboard byte (edge detect)
 	even
+rot_sin_y:	dc.w	0
+rot_cos_y:	dc.w	0
+rot_sin_x:	dc.w	0
+rot_cos_x:	dc.w	0
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -380,6 +394,63 @@ InitStars:
 	rts
 
 ;==========================================================
+; EraseStar — clear old pixel for star at (a2)
+; In:  a0=BPLANE2, a2=star ptr, a4=yoffset_table
+; Out: —
+; Trashes: d0-d2, d4
+;==========================================================
+EraseStar:
+	move.w	STAR_OPX(a2),d0
+	cmp.w	#$FFFF,d0
+	beq.s	.done
+	move.w	STAR_OPY(a2),d1
+	add.w	d1,d1
+	move.w	0(a4,d1.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bclr	d2,0(a0,d4.w)
+.done:	rts
+
+;==========================================================
+; ProjectAndPlot — bounds check, plot pixel, store OPX/OPY
+; In:  d0=screen_x, d1=screen_y
+;      a0=BPLANE2, a2=star ptr, a4=yoffset_table
+; Out: d0 = 0 if OOB, non-zero if plotted
+; Trashes: d0, d2, d4
+;==========================================================
+ProjectAndPlot:
+	tst.w	d0
+	blt.s	.oob
+	cmp.w	#383,d0
+	bgt.s	.oob
+	tst.w	d1
+	blt.s	.oob
+	cmp.w	#255,d1
+	bgt.s	.oob
+	; In bounds — plot
+	move.w	d1,d4
+	add.w	d4,d4
+	move.w	0(a4,d4.w),d4
+	move.w	d0,d2
+	lsr.w	#3,d2
+	add.w	d2,d4
+	move.w	d0,d2
+	not.w	d2
+	and.w	#7,d2
+	bset	d2,0(a0,d4.w)
+	move.w	d0,STAR_OPX(a2)
+	move.w	d1,STAR_OPY(a2)
+	moveq	#1,d0
+	rts
+.oob:	move.w	#$FFFF,STAR_OPX(a2)
+	moveq	#0,d0
+	rts
+
+;==========================================================
 ; UpdateStars — per-star erase, advance, project, plot
 ;
 ; Register usage inside the star loop:
@@ -422,30 +493,34 @@ UpdateStars:
 	move.w	#NUM_STARS-1,d7
 
 .starLoop:
-	; ---- 1. Erase old pixel (if drawn) ----
-	move.w	STAR_OPX(a2),d0
-	cmp.w	#$FFFF,d0
-	beq.s	.skipErase
+	bsr.w	EraseStar
 
-	move.w	STAR_OPY(a2),d1
-	add.w	d1,d1			; word index
-	move.w	0(a4,d1.w),d4		; d4 = old_py * 48
-	move.w	d0,d2
-	lsr.w	#3,d2			; byte in line
-	add.w	d2,d4			; d4 = byte offset in plane
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2			; bit number (7-(px&7))
-	bclr	d2,0(a0,d4.w)
-
-.skipErase:
-	; ---- 2. Advance Z ----
+	; Advance Z
 	move.w	STAR_SZ(a2),d0
 	sub.w	current_zspeed(pc),d0
 	cmp.w	#MIN_Z,d0
 	ble.s	.respawn
 	move.w	d0,STAR_SZ(a2)
-	bra.s	.project
+
+	; Perspective projection
+	move.w	STAR_SZ(a2),d0
+	add.w	d0,d0			; word index into recip table
+	move.w	0(a3,d0.w),d1		; d1 = recip[sz]
+
+	move.w	d1,d3			; save recip for Y axis
+	move.w	STAR_SX(a2),d0
+	muls	d1,d0
+	asr.l	#8,d0
+	add.w	d5,d0			; d0 = screen X
+
+	move.w	STAR_SY(a2),d1
+	muls	d3,d1
+	asr.l	#8,d1
+	add.w	d6,d1			; d1 = screen Y
+
+	bsr.w	ProjectAndPlot
+	tst.w	d0
+	bne.s	.nextStar
 
 .respawn:
 	bsr.w	LFSRNext
@@ -458,68 +533,6 @@ UpdateStars:
 	move.w	d0,STAR_SY(a2)
 	move.w	#MAX_Z,STAR_SZ(a2)
 	move.w	#$FFFF,STAR_OPX(a2)
-	bra.w	.nextStar
-
-.project:
-	; ---- 3. Perspective projection ----
-	move.w	STAR_SZ(a2),d0
-	add.w	d0,d0			; word index into recip table
-	move.w	0(a3,d0.w),d1		; d1 = recip[sz]
-
-	; screen_x = (sx * recip[sz]) >> 8 + centerX
-	move.w	d1,d3			; save recip for Y axis
-	move.w	STAR_SX(a2),d0
-	muls	d1,d0
-	asr.l	#8,d0
-	add.w	d5,d0			; d0 = screen X
-
-	; screen_y = (sy * recip[sz]) >> 8 + centerY
-	move.w	STAR_SY(a2),d1
-	muls	d3,d1
-	asr.l	#8,d1
-	add.w	d6,d1			; d1 = screen Y
-
-	; ---- 4. Bounds check ----
-	tst.w	d0
-	blt.s	.oob
-	cmp.w	#383,d0
-	bgt.s	.oob
-	tst.w	d1
-	blt.s	.oob
-	cmp.w	#255,d1
-	bgt.s	.oob
-	bra.s	.doPlot
-
-.oob:
-	; Out of bounds — respawn at far Z
-	bsr.w	LFSRNext
-	move.b	d2,d0
-	ext.w	d0
-	move.w	d0,STAR_SX(a2)
-	bsr.w	LFSRNext
-	move.b	d2,d0
-	ext.w	d0
-	move.w	d0,STAR_SY(a2)
-	move.w	#MAX_Z,STAR_SZ(a2)
-	move.w	#$FFFF,STAR_OPX(a2)
-	bra.s	.nextStar
-
-.doPlot:
-	; ---- 5. Plot new pixel ----
-	move.w	d1,d4
-	add.w	d4,d4			; word index
-	move.w	0(a4,d4.w),d4		; d4 = screenY * 48
-	move.w	d0,d2
-	lsr.w	#3,d2			; byte in line
-	add.w	d2,d4			; d4 = byte offset
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2			; bit number
-	bset	d2,0(a0,d4.w)
-
-	; ---- 6. Store new old position ----
-	move.w	d0,STAR_OPX(a2)
-	move.w	d1,STAR_OPY(a2)
 
 .nextStar:
 	lea	STAR_SIZE(a2),a2
@@ -561,10 +574,11 @@ TargetPtrTable:
 	dc.l	pyramid_targets		; shape 3 = pyramid
 
 ;==========================================================
-; MorphStars — ease stars toward current targets, rotate, project
-; Uses exponential ease: pos += (target - pos) >> 3
+; ShapeStars — rotate stars toward/at shape targets
+; Handles both EFFECT_MORPH (easing) and EFFECT_DISPLAY (direct)
+; Uses rot_sin/cos variables instead of stack for sin/cos cache
 ;==========================================================
-MorphStars:
+ShapeStars:
 	movem.l	d2-d7/a2-a5,-(sp)
 
 	lea	BPLANE2,a0
@@ -573,87 +587,81 @@ MorphStars:
 	lea	STAR_ARRAY,a2
 	lea	signed_sine_table(pc),a5
 
-	; Cache sin/cos for Y and X rotation on stack
+	; Compute sin/cos for Y rotation → variables
 	move.w	angle_y(pc),d0
 	and.w	#$FF,d0
 	add.w	d0,d0
-	move.w	0(a5,d0.w),d1		; sin_y
+	move.w	0(a5,d0.w),rot_sin_y
 	move.w	angle_y(pc),d0
 	add.w	#64,d0
 	and.w	#$FF,d0
 	add.w	d0,d0
-	move.w	0(a5,d0.w),d2		; cos_y
+	move.w	0(a5,d0.w),rot_cos_y
 
+	; Compute sin/cos for X rotation → variables
 	move.w	angle_x(pc),d0
 	and.w	#$FF,d0
 	add.w	d0,d0
-	move.w	0(a5,d0.w),d3		; sin_x
+	move.w	0(a5,d0.w),rot_sin_x
 	move.w	angle_x(pc),d0
 	add.w	#64,d0
 	and.w	#$FF,d0
 	add.w	d0,d0
-	move.w	0(a5,d0.w),d4		; cos_x
-
-	; Push sin/cos values: sin_y, cos_y, sin_x, cos_x
-	move.w	d4,-(sp)		; cos_x [0(sp)]
-	move.w	d3,-(sp)		; sin_x [2(sp)]
-	move.w	d2,-(sp)		; cos_y [4(sp)]
-	move.w	d1,-(sp)		; sin_y [6(sp)]
+	move.w	0(a5,d0.w),rot_cos_x
 
 	move.l	current_targets(pc),a1
 
 	move.w	#NUM_STARS-1,d7
 
-.mstarLoop:
-	; ---- 1. Erase old pixel ----
-	move.w	STAR_OPX(a2),d0
-	cmp.w	#$FFFF,d0
-	beq.s	.mskipErase
-	move.w	STAR_OPY(a2),d1
-	add.w	d1,d1
-	move.w	0(a4,d1.w),d4
-	move.w	d0,d2
-	lsr.w	#3,d2
-	add.w	d2,d4
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2
-	bclr	d2,0(a0,d4.w)
-.mskipErase:
+.starLoop:
+	bsr.w	EraseStar
 
-	; ---- 2. Ease toward target ----
+	; Branch: morph (ease) or display (direct read)
+	move.w	effect_state(pc),d0
+	cmp.w	#EFFECT_MORPH,d0
+	beq.s	.ease
+
+	; --- Direct read (display mode) ---
+	move.w	(a1),d0
+	move.w	2(a1),d1
+	move.w	4(a1),d2
+	bra.s	.rotate
+
+.ease:
+	; --- Exponential ease (morph mode) ---
 	; sx += (target_x - sx) >> 3
-	move.w	(a1),d0			; target_x
+	move.w	(a1),d0
 	sub.w	STAR_SX(a2),d0
 	asr.w	#3,d0
 	add.w	d0,STAR_SX(a2)
 
-	move.w	2(a1),d0		; target_y
+	move.w	2(a1),d0
 	sub.w	STAR_SY(a2),d0
 	asr.w	#3,d0
 	add.w	d0,STAR_SY(a2)
 
-	move.w	4(a1),d0		; target_z
+	move.w	4(a1),d0
 	sub.w	STAR_SZ(a2),d0
 	asr.w	#3,d0
 	add.w	d0,STAR_SZ(a2)
 
-	; ---- 3. 3D rotate (Y then X) and project ----
-	move.w	STAR_SX(a2),d0		; x
-	move.w	STAR_SY(a2),d1		; y
-	move.w	STAR_SZ(a2),d2		; z
+	move.w	STAR_SX(a2),d0
+	move.w	STAR_SY(a2),d1
+	move.w	STAR_SZ(a2),d2
 
+.rotate:
+	; 3D rotation: Y then X
 	; Y rotation: x' = (x*cos_y + z*sin_y) >> 7
 	;             z' = (z*cos_y - x*sin_y) >> 7
 	move.w	d0,d3			; save x
 	move.w	d2,d4			; save z
-	muls	4(sp),d0		; x * cos_y
-	muls	6(sp),d4		; z * sin_y
+	muls	rot_cos_y(pc),d0	; x * cos_y
+	muls	rot_sin_y(pc),d4	; z * sin_y
 	add.l	d4,d0
 	asr.l	#7,d0			; d0 = x'
 	move.w	d2,d4			; z
-	muls	4(sp),d4		; z * cos_y
-	muls	6(sp),d3		; x * sin_y
+	muls	rot_cos_y(pc),d4	; z * cos_y
+	muls	rot_sin_y(pc),d3	; x * sin_y
 	sub.l	d3,d4
 	asr.l	#7,d4			; d4 = z'
 
@@ -661,13 +669,13 @@ MorphStars:
 	;             z'' = (y*sin_x + z'*cos_x) >> 7
 	move.w	d1,d3			; save y
 	move.w	d4,d5			; save z'
-	muls	0(sp),d1		; y * cos_x
-	muls	2(sp),d5		; z' * sin_x
+	muls	rot_cos_x(pc),d1	; y * cos_x
+	muls	rot_sin_x(pc),d5	; z' * sin_x
 	sub.l	d5,d1
 	asr.l	#7,d1			; d1 = y'
 	move.w	d3,d5			; y
-	muls	2(sp),d5		; y * sin_x
-	muls	0(sp),d4		; z' * cos_x
+	muls	rot_sin_x(pc),d5	; y * sin_x
+	muls	rot_cos_x(pc),d4	; z' * cos_x
 	add.l	d5,d4
 	asr.l	#7,d4			; d4 = z''
 
@@ -676,11 +684,11 @@ MorphStars:
 
 	; Project: recip lookup
 	cmp.w	#MIN_Z,d4
-	ble.w	.mskipPlot
+	ble.s	.skipPlot
 	cmp.w	#255,d4
-	ble.s	.mzOk
+	ble.s	.zOk
 	move.w	#255,d4
-.mzOk:
+.zOk:
 	move.w	d4,d5
 	add.w	d5,d5
 	move.w	0(a3,d5.w),d5		; recip[z]
@@ -695,42 +703,16 @@ MorphStars:
 	asr.l	#8,d1
 	add.w	#CENTER_Y,d1
 
-	; Bounds check
-	tst.w	d0
-	blt.s	.mskipPlot
-	cmp.w	#383,d0
-	bgt.s	.mskipPlot
-	tst.w	d1
-	blt.s	.mskipPlot
-	cmp.w	#255,d1
-	bgt.s	.mskipPlot
+	bsr.w	ProjectAndPlot
+	bra.s	.nextStar
 
-	; ---- 4. Plot pixel ----
-	move.w	d1,d4
-	add.w	d4,d4
-	move.w	0(a4,d4.w),d4
-	move.w	d0,d2
-	lsr.w	#3,d2
-	add.w	d2,d4
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2
-	bset	d2,0(a0,d4.w)
-
-	move.w	d0,STAR_OPX(a2)
-	move.w	d1,STAR_OPY(a2)
-	bra.s	.mnextStar
-
-.mskipPlot:
+.skipPlot:
 	move.w	#$FFFF,STAR_OPX(a2)
 
-.mnextStar:
-	lea	6(a1),a1		; next cube target
+.nextStar:
+	lea	6(a1),a1
 	lea	STAR_SIZE(a2),a2
-	dbf	d7,.mstarLoop
-
-	; Clean up stack (4 words)
-	addq.l	#8,sp
+	dbf	d7,.starLoop
 
 	; Advance angles
 	addq.w	#2,angle_y
@@ -738,11 +720,14 @@ MorphStars:
 	addq.w	#1,angle_x
 	and.w	#$FF,angle_x
 
-	; Check morph completion
+	; Check morph completion (only in morph state)
+	move.w	effect_state(pc),d0
+	cmp.w	#EFFECT_MORPH,d0
+	bne.s	.done
 	addq.w	#1,morph_counter
 	move.w	morph_counter(pc),d0
 	cmp.w	#MORPH_DURATION,d0
-	blt.s	.morphNotDone
+	blt.s	.done
 	; Morph complete — decide next state
 	move.w	shape_index(pc),d0
 	tst.w	d0
@@ -750,173 +735,11 @@ MorphStars:
 	; shape_index 0 = tunnel
 	move.w	#EFFECT_TUNNEL,effect_state
 	clr.w	display_timer
-	bra.s	.morphNotDone
+	bra.s	.done
 .toDisplay:
 	move.w	#EFFECT_DISPLAY,effect_state
 	clr.w	display_timer
-.morphNotDone:
-
-	movem.l	(sp)+,d2-d7/a2-a5
-	rts
-
-;==========================================================
-; DisplayShape — rotate shape targets, project, plot
-; Pure rotation mode (no easing, positions = current targets)
-;==========================================================
-DisplayShape:
-	movem.l	d2-d7/a2-a5,-(sp)
-
-	lea	BPLANE2,a0
-	lea	recip_table(pc),a3
-	lea	yoffset_table(pc),a4
-	lea	STAR_ARRAY,a2
-	lea	signed_sine_table(pc),a5
-
-	; Cache sin/cos for Y and X rotation on stack
-	move.w	angle_y(pc),d0
-	and.w	#$FF,d0
-	add.w	d0,d0
-	move.w	0(a5,d0.w),d1		; sin_y
-	move.w	angle_y(pc),d0
-	add.w	#64,d0
-	and.w	#$FF,d0
-	add.w	d0,d0
-	move.w	0(a5,d0.w),d2		; cos_y
-
-	move.w	angle_x(pc),d0
-	and.w	#$FF,d0
-	add.w	d0,d0
-	move.w	0(a5,d0.w),d3		; sin_x
-	move.w	angle_x(pc),d0
-	add.w	#64,d0
-	and.w	#$FF,d0
-	add.w	d0,d0
-	move.w	0(a5,d0.w),d4		; cos_x
-
-	; Push sin/cos: sin_y, cos_y, sin_x, cos_x
-	move.w	d4,-(sp)		; cos_x [0(sp)]
-	move.w	d3,-(sp)		; sin_x [2(sp)]
-	move.w	d2,-(sp)		; cos_y [4(sp)]
-	move.w	d1,-(sp)		; sin_y [6(sp)]
-
-	move.l	current_targets(pc),a1
-
-	move.w	#NUM_STARS-1,d7
-
-.cstarLoop:
-	; ---- 1. Erase old pixel ----
-	move.w	STAR_OPX(a2),d0
-	cmp.w	#$FFFF,d0
-	beq.s	.cskipErase
-	move.w	STAR_OPY(a2),d1
-	add.w	d1,d1
-	move.w	0(a4,d1.w),d4
-	move.w	d0,d2
-	lsr.w	#3,d2
-	add.w	d2,d4
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2
-	bclr	d2,0(a0,d4.w)
-.cskipErase:
-
-	; ---- 2. Read cube target directly ----
-	move.w	(a1),d0			; x
-	move.w	2(a1),d1		; y
-	move.w	4(a1),d2		; z
-
-	; ---- 3. 3D rotate (Y then X) and project ----
-	; Y rotation
-	move.w	d0,d3
-	move.w	d2,d4
-	muls	4(sp),d0		; x * cos_y
-	muls	6(sp),d4		; z * sin_y
-	add.l	d4,d0
-	asr.l	#7,d0			; x'
-	move.w	d2,d4
-	muls	4(sp),d4		; z * cos_y
-	muls	6(sp),d3		; x * sin_y
-	sub.l	d3,d4
-	asr.l	#7,d4			; z'
-
-	; X rotation
-	move.w	d1,d3
-	move.w	d4,d5
-	muls	0(sp),d1		; y * cos_x
-	muls	2(sp),d5		; z' * sin_x
-	sub.l	d5,d1
-	asr.l	#7,d1			; y'
-	move.w	d3,d5
-	muls	2(sp),d5		; y * sin_x
-	muls	0(sp),d4		; z' * cos_x
-	add.l	d5,d4
-	asr.l	#7,d4			; z''
-
-	; Add base Z
-	add.w	current_base_z(pc),d4
-
-	; Project
-	cmp.w	#MIN_Z,d4
-	ble.w	.cskipPlot
-	cmp.w	#255,d4
-	ble.s	.czOk
-	move.w	#255,d4
-.czOk:
-	move.w	d4,d5
-	add.w	d5,d5
-	move.w	0(a3,d5.w),d5		; recip[z]
-
-	muls	d5,d0
-	asr.l	#8,d0
-	add.w	#CENTER_X,d0
-
-	muls	d5,d1
-	asr.l	#8,d1
-	add.w	#CENTER_Y,d1
-
-	; Bounds check
-	tst.w	d0
-	blt.s	.cskipPlot
-	cmp.w	#383,d0
-	bgt.s	.cskipPlot
-	tst.w	d1
-	blt.s	.cskipPlot
-	cmp.w	#255,d1
-	bgt.s	.cskipPlot
-
-	; ---- 4. Plot pixel ----
-	move.w	d1,d4
-	add.w	d4,d4
-	move.w	0(a4,d4.w),d4
-	move.w	d0,d2
-	lsr.w	#3,d2
-	add.w	d2,d4
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2
-	bset	d2,0(a0,d4.w)
-
-	move.w	d0,STAR_OPX(a2)
-	move.w	d1,STAR_OPY(a2)
-	bra.s	.cnextStar
-
-.cskipPlot:
-	move.w	#$FFFF,STAR_OPX(a2)
-
-.cnextStar:
-	lea	6(a1),a1
-	lea	STAR_SIZE(a2),a2
-	dbf	d7,.cstarLoop
-
-	; Clean up stack
-	addq.l	#8,sp
-
-	; Advance angles
-	addq.w	#2,angle_y
-	and.w	#$FF,angle_y
-	addq.w	#1,angle_x
-	and.w	#$FF,angle_x
-
+.done:
 	movem.l	(sp)+,d2-d7/a2-a5
 	rts
 
@@ -927,17 +750,15 @@ BuildCopper:
 	movem.l	d2-d7/a2-a4,-(sp)
 
 	; --- Header ---
-	move.l	#(DIWSTRT<<16)|$2C81,(a0)+
-	move.l	#(DIWSTOP<<16)|$2CC1,(a0)+
-	move.l	#(DDFSTRT<<16)|$0030,(a0)+
-	move.l	#(DDFSTOP<<16)|$00D0,(a0)+
-	; BPLCON0: 2 bitplanes, color on
-	move.l	#(BPLCON0<<16)|$2200,(a0)+
+	move.l	#(DIWSTRT<<16)|DIWSTRT_VAL,(a0)+
+	move.l	#(DIWSTOP<<16)|DIWSTOP_VAL,(a0)+
+	move.l	#(DDFSTRT<<16)|DDFSTRT_VAL,(a0)+
+	move.l	#(DDFSTOP<<16)|DDFSTOP_VAL,(a0)+
+	move.l	#(BPLCON0<<16)|BPLCON0_VAL,(a0)+
 	move.l	#(BPLCON1<<16)|$0000,(a0)+
 	move.l	#(BPLCON2<<16)|$0000,(a0)+
-	; Modulos: 48 - 42 = 6 (21 words fetched, we want 48-byte lines)
-	move.l	#(BPL1MOD<<16)|6,(a0)+
-	move.l	#(BPL2MOD<<16)|6,(a0)+
+	move.l	#(BPL1MOD<<16)|BPL_MODULO,(a0)+
+	move.l	#(BPL2MOD<<16)|BPL_MODULO,(a0)+
 
 	; BPL2 pointer (stars — static, set once)
 	move.l	#(BPL2PTH<<16)|(BPLANE2>>16),(a0)+
@@ -1060,4 +881,4 @@ LogoBitmap:
 
 	even
 moddata:
-	incbin	"music.mod"
+	incbin	"cool.mod"
