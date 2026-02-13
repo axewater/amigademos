@@ -1,8 +1,7 @@
 ASM = vasmm68k_mot
 PYTHON = python
 AFLAGS = -Fbin -m68000 -nosym
-
-TARGET = dewdzki-fxp.adf
+TARGET = part2.adf
 BOOTBIN = boot.bin
 DEMOBIN = demo.bin
 TABLES = tables.i
@@ -15,7 +14,7 @@ $(TARGET): $(BOOTBIN) $(DEMOBIN) makeadf.py
 $(BOOTBIN): boot.s
 	$(ASM) $(AFLAGS) -o $(BOOTBIN) boot.s
 
-$(DEMOBIN): demo.s $(TABLES) ptplayer_minimal.asm trance.mod
+$(DEMOBIN): demo.s $(TABLES) ptplayer_minimal.asm part2.mod
 	$(ASM) $(AFLAGS) -o $(DEMOBIN) demo.s
 
 $(TABLES): gentables.py

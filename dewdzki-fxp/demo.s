@@ -2,7 +2,7 @@
 ; DEWDZKI-FXP Main Demo
 ; Loaded at $49000 by bootblock trackloader
 ; OCS A500 PAL — 2 bitplanes, 384px wide
-; Effects: copper raster bars, sine-wave logo, shape-cycling starfield
+; Effects: copper terrain logo, raster bars, sine-wave scroll, starfield
 ;----------------------------------------------------------
 
 ; Memory map (chip RAM)
@@ -219,6 +219,10 @@ MainLoop:
 	and.w	#$FF,sine_phase
 	addq.w	#2,orbit_phase
 	and.w	#$FF,orbit_phase
+	addq.w	#1,terrain_phase1
+	and.w	#$FF,terrain_phase1
+	addq.w	#3,terrain_phase2
+	and.w	#$FF,terrain_phase2
 
 	bra.w	MainLoop
 
@@ -249,6 +253,9 @@ rot_sin_y:	dc.w	0
 rot_cos_y:	dc.w	0
 rot_sin_x:	dc.w	0
 rot_cos_x:	dc.w	0
+channel_energies: dc.w	0,0,0,0		; per-channel attack/decay (0-64)
+terrain_phase1:	dc.w	0		; slow vertical wave phase
+terrain_phase2:	dc.w	0		; fast vertical ripple phase
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -265,33 +272,41 @@ WaitVBL:
 	rts
 
 ;==========================================================
-; UpdateMusicEnergy — read active channel volume, attack/decay
-; Drives current_zspeed (tunnel) and current_base_z (shapes)
-; Trashes: d0, d1, a0
+; UpdateMusicEnergy — read all 4 channel volumes, attack/decay
+; Drives terrain (ch0/ch1), starfield from active_channel
+; Trashes: d0, d1, d3, a0-a2
 ;==========================================================
 UpdateMusicEnergy:
+	; --- Update all 4 channel energies ---
 	lea	mt_data,a0
-	move.w	channel_vol_off(pc),d0
-	move.w	0(a0,d0.w),d0		; active channel volume (0-64)
-	move.w	music_energy(pc),d1
+	lea	channel_energies(pc),a1
+	lea	ChannelVolumeOffsets(pc),a2
+	moveq	#3,d3
+.chLoop:
+	move.w	(a2)+,d0
+	move.w	0(a0,d0.w),d0		; channel volume (0-64)
+	move.w	(a1),d1			; current energy
 	cmp.w	d1,d0
-	bgt.s	.attack
-	; Decay
+	bgt.s	.chAtt
 	subq.w	#ENERGY_DECAY,d1
-	bpl.s	.store
+	bpl.s	.chSto
 	moveq	#0,d1
-	bra.s	.store
-.attack:
-	move.w	d0,d1
-.store:
+	bra.s	.chSto
+.chAtt:	move.w	d0,d1
+.chSto:	move.w	d1,(a1)+
+	dbf	d3,.chLoop
+	; --- Starfield drive from active channel ---
+	move.w	active_channel(pc),d0
+	add.w	d0,d0
+	lea	channel_energies(pc),a1
+	move.w	0(a1,d0.w),d1
 	move.w	d1,music_energy
 	; z_speed = MIN_ZSPEED + (energy >> 3)  ->  1..9
 	move.w	d1,d0
 	lsr.w	#3,d0
 	addq.w	#MIN_ZSPEED,d0
 	move.w	d0,current_zspeed
-	; base_z = SHAPE_BASE_Z - (energy >> 1)  ->  160..128
-	lsr.w	#1,d1
+	; base_z = SHAPE_BASE_Z - energy  ->  160..96
 	move.w	#SHAPE_BASE_Z,d0
 	sub.w	d1,d0
 	move.w	d0,current_base_z
@@ -304,6 +319,7 @@ UpdateMusicEnergy:
 CIAA_SDR	equ	$BFEC01
 CIAA_CRA	equ	$BFEE01
 KEY_SPACE	equ	$40
+KEY_S		equ	$21
 
 CheckKeyboard:
 	move.b	CIAA_SDR,d0
@@ -315,6 +331,12 @@ CheckKeyboard:
 	ror.b	#1,d0
 	btst	#7,d0			; key-up?
 	bne.s	.ckHandshake		; ignore releases, just handshake
+	cmp.b	#KEY_S,d0
+	bne.s	.notS
+	; S pressed — cycle to next shape
+	bsr.w	StartNextMorph
+	bra.s	.ckHandshake
+.notS:
 	cmp.b	#KEY_SPACE,d0
 	bne.s	.ckHandshake
 	; Spacebar pressed — cycle channel
@@ -747,7 +769,7 @@ ShapeStars:
 ; BuildCopper — build copper list at (a0)
 ;==========================================================
 BuildCopper:
-	movem.l	d2-d7/a2-a4,-(sp)
+	movem.l	d2-d7/a2-a5,-(sp)
 
 	; --- Header ---
 	move.l	#(DIWSTRT<<16)|DIWSTRT_VAL,(a0)+
@@ -772,13 +794,14 @@ BuildCopper:
 	; --- Per-scanline ---
 	lea	sine_table(pc),a2
 	lea	gradient_table(pc),a3
+	lea	yoffset_table(pc),a4
+	lea	signed_sine_table(pc),a5
 	move.w	gradient_phase(pc),d2
 	move.w	sine_phase(pc),d3
 
 	moveq	#0,d4			; line counter
 	move.w	#$2C,d5			; starting VPOS
 	moveq	#0,d1			; V8 barrier flag
-	move.l	#BPLANE1,d7		; running BPL1 address
 
 .perLine:
 	; V8 barrier crossing
@@ -806,13 +829,53 @@ BuildCopper:
 	move.w	#COLOR01,(a0)+
 	move.w	0(a3,d0.w),(a0)+
 
-	; Sine scroll: compute fine/coarse from sine table
+	; --- Vertical terrain displacement ---
+	; Wave 1: signed_sine[(line + phase1) & 255] * ch_energy[0] >> 8
+	move.w	d4,d0
+	add.w	terrain_phase1(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0			; word index
+	move.w	0(a5,d0.w),d0		; signed sine (-127..+127)
+	muls	channel_energies(pc),d0	; * ch0 energy (0-64)
+	asr.l	#8,d0			; ±31 max
+	move.w	d0,d6			; d6 = wave1
+
+	; Wave 2: signed_sine[(line*2 + phase2) & 255] * ch_energy[1] >> 9
+	move.w	d4,d0
+	add.w	d4,d0			; line * 2
+	add.w	terrain_phase2(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	0(a5,d0.w),d0
+	muls	channel_energies+2(pc),d0 ; * ch1 energy
+	asr.l	#8,d0
+	asr.w	#1,d0			; ±15 max
+	add.w	d0,d6			; d6 = total vert_offset
+
+	; Source row = clamp(line + vert_offset, 0, 255)
+	move.w	d4,d0
+	add.w	d6,d0
+	bpl.s	.vNotNeg
+	moveq	#0,d0
+	bra.s	.vClamped
+.vNotNeg:
+	cmp.w	#255,d0
+	ble.s	.vClamped
+	move.w	#255,d0
+.vClamped:
+	; BPL1 row base from yoffset table
+	add.w	d0,d0			; word index
+	moveq	#0,d7
+	move.w	0(a4,d0.w),d7		; src_row * BPWIDTH
+	add.l	#BPLANE1,d7		; d7 = BPL1 base for displaced row
+
+	; --- Horizontal sine scroll ---
 	; d3 = sine_phase (will be temporarily trashed, reloaded at end)
 	move.w	d4,d0
 	add.w	d3,d0
 	and.w	#$FF,d0
 	moveq	#0,d6
-	move.b	0(a2,d0.w),d6		; d6 = sine value 0-63
+	move.b	0(a2,d0.w),d6		; d6 = sine value 0-48
 
 	; Decompose into fine scroll + coarse byte offset
 	move.w	d6,d0			; d0 = sine_val copy
@@ -823,8 +886,8 @@ BuildCopper:
 	add.w	d6,d6			; coarse bytes
 	ext.l	d6
 
-	; BPL1PT = running base + coarse offset
-	move.l	d7,d3			; d3 = copy of running BPL1 base
+	; BPL1PT = displaced row base + coarse horizontal offset
+	move.l	d7,d3			; d3 = displaced row base
 	add.l	d6,d3			; d3 = final BPL1PT
 
 	move.w	#BPL1PTH,(a0)+
@@ -841,9 +904,6 @@ BuildCopper:
 	; Restore d3 = sine_phase (was trashed above)
 	move.w	sine_phase(pc),d3
 
-	; Advance running BPL1 pointer
-	add.l	#BPWIDTH,d7
-
 	addq.w	#1,d4
 	addq.w	#1,d5
 	cmp.w	#BPHEIGHT,d4
@@ -852,7 +912,7 @@ BuildCopper:
 	; End
 	move.l	#$FFFFFFFE,(a0)+
 
-	movem.l	(sp)+,d2-d7/a2-a4
+	movem.l	(sp)+,d2-d7/a2-a5
 	rts
 
 ;==========================================================
@@ -881,4 +941,4 @@ LogoBitmap:
 
 	even
 moddata:
-	incbin	"cool.mod"
+	incbin	"trance.mod"
