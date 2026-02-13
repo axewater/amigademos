@@ -25,6 +25,8 @@ STAR_SIZE	equ	10		; bytes per star entry
 MIN_Z		equ	5
 MAX_Z		equ	255
 Z_SPEED		equ	2
+ENERGY_DECAY	equ	2		; decay per frame (~0.64s full decay)
+MIN_ZSPEED	equ	1		; Z speed when silent
 CENTER_X	equ	192		; screen center X
 CENTER_Y	equ	128		; screen center Y
 ORBIT_RADIUS	equ	31		; +/-31 pixels orbit
@@ -155,6 +157,8 @@ Start:
 ;==========================================================
 MainLoop:
 	bsr.w	WaitVBL
+	bsr.w	UpdateMusicEnergy
+	bsr.w	CheckKeyboard
 
 	; Swap copper buffers
 	move.l	cop_front(pc),d0
@@ -224,6 +228,13 @@ angle_x:	dc.w	0
 shape_index:	dc.w	0		; 0=tunnel, 1=cube, 2=sphere, 3=pyramid
 display_timer:	dc.w	0		; frames in current display/tunnel
 current_targets: dc.l	0		; pointer to active target array
+music_energy:	dc.w	0		; attack/decay envelope tracking channel (0-64)
+current_zspeed:	dc.w	2		; computed Z speed this frame (1-9)
+current_base_z:	dc.w	SHAPE_BASE_Z	; dynamic base Z for shape modes
+active_channel:	dc.w	0		; which MOD channel to track (0-3)
+channel_vol_off: dc.w	mt_chan1+n_volume ; precomputed offset into mt_data
+last_rawkey:	dc.b	0		; last raw keyboard byte (edge detect)
+	even
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -238,6 +249,81 @@ WaitVBL:
 	cmp.l	#300<<8,d0
 	beq.s	.wv2
 	rts
+
+;==========================================================
+; UpdateMusicEnergy — read active channel volume, attack/decay
+; Drives current_zspeed (tunnel) and current_base_z (shapes)
+; Trashes: d0, d1, a0
+;==========================================================
+UpdateMusicEnergy:
+	lea	mt_data,a0
+	move.w	channel_vol_off(pc),d0
+	move.w	0(a0,d0.w),d0		; active channel volume (0-64)
+	move.w	music_energy(pc),d1
+	cmp.w	d1,d0
+	bgt.s	.attack
+	; Decay
+	subq.w	#ENERGY_DECAY,d1
+	bpl.s	.store
+	moveq	#0,d1
+	bra.s	.store
+.attack:
+	move.w	d0,d1
+.store:
+	move.w	d1,music_energy
+	; z_speed = MIN_ZSPEED + (energy >> 3)  ->  1..9
+	move.w	d1,d0
+	lsr.w	#3,d0
+	addq.w	#MIN_ZSPEED,d0
+	move.w	d0,current_zspeed
+	; base_z = SHAPE_BASE_Z - (energy >> 1)  ->  160..128
+	lsr.w	#1,d1
+	move.w	#SHAPE_BASE_Z,d0
+	sub.w	d1,d0
+	move.w	d0,current_base_z
+	rts
+
+;==========================================================
+; CheckKeyboard — spacebar cycles active MOD channel (0-3)
+; Trashes: d0, a0
+;==========================================================
+CIAA_SDR	equ	$BFEC01
+CIAA_CRA	equ	$BFEE01
+KEY_SPACE	equ	$40
+
+CheckKeyboard:
+	move.b	CIAA_SDR,d0
+	cmp.b	last_rawkey(pc),d0
+	beq.s	.ckDone
+	move.b	d0,last_rawkey
+	; Decode: invert and rotate
+	not.b	d0
+	ror.b	#1,d0
+	btst	#7,d0			; key-up?
+	bne.s	.ckHandshake		; ignore releases, just handshake
+	cmp.b	#KEY_SPACE,d0
+	bne.s	.ckHandshake
+	; Spacebar pressed — cycle channel
+	move.w	active_channel(pc),d0
+	addq.w	#1,d0
+	and.w	#3,d0
+	move.w	d0,active_channel
+	add.w	d0,d0
+	lea	ChannelVolumeOffsets(pc),a0
+	move.w	0(a0,d0.w),d0
+	move.w	d0,channel_vol_off
+.ckHandshake:
+	or.b	#$40,CIAA_CRA		; start handshake
+	or.b	#$40,CIAA_CRA		; redundant write = delay
+	and.b	#$BF,CIAA_CRA		; end handshake
+.ckDone:
+	rts
+
+ChannelVolumeOffsets:
+	dc.w	mt_chan1+n_volume
+	dc.w	mt_chan2+n_volume
+	dc.w	mt_chan3+n_volume
+	dc.w	mt_chan4+n_volume
 
 ;==========================================================
 ; LFSRNext — 16-bit Galois LFSR, random result in d2
@@ -355,7 +441,7 @@ UpdateStars:
 .skipErase:
 	; ---- 2. Advance Z ----
 	move.w	STAR_SZ(a2),d0
-	sub.w	#Z_SPEED,d0
+	sub.w	current_zspeed(pc),d0
 	cmp.w	#MIN_Z,d0
 	ble.s	.respawn
 	move.w	d0,STAR_SZ(a2)
@@ -586,7 +672,7 @@ MorphStars:
 	asr.l	#7,d4			; d4 = z''
 
 	; Add base Z for projection
-	add.w	#SHAPE_BASE_Z,d4
+	add.w	current_base_z(pc),d4
 
 	; Project: recip lookup
 	cmp.w	#MIN_Z,d4
@@ -767,7 +853,7 @@ DisplayShape:
 	asr.l	#7,d4			; z''
 
 	; Add base Z
-	add.w	#SHAPE_BASE_Z,d4
+	add.w	current_base_z(pc),d4
 
 	; Project
 	cmp.w	#MIN_Z,d4
