@@ -365,6 +365,106 @@ def gen_helix_targets():
         coords.append((x, y, z))
     return _emit_targets("helix_targets", "Helix targets: 120 x (x,y,z)", coords)
 
+# ── Bouncing sprite logo: 16x16 "D" glyph as sprite data words ──
+def gen_bounce_sprite():
+    """Generate a 16x16 'D' sprite glyph as two word-planes (OCS sprite format).
+    Outputs 16 rows of (word_a, word_b) for color 3 (both planes set)."""
+    # 16x16 bold 'D' glyph — hand-drawn
+    rows = [
+        0b1111111100000000,
+        0b1111111111000000,
+        0b1100001111100000,
+        0b1100000011110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000001110000,
+        0b1100000011110000,
+        0b1100001111100000,
+        0b1111111111000000,
+        0b1111111100000000,
+        0b0000000000000000,
+    ]
+    lines = ["; Bounce sprite glyph: 16x16 'D', 16 rows of (wordA, wordB)"]
+    lines.append("; Both planes set = color 3")
+    lines.append("bounce_glyph:")
+    for r in rows:
+        lines.append(f"\tdc.w\t${r:04X},${r:04X}")
+    return "\n".join(lines)
+
+# ── Tunnel color table (256 words) — bright blue/purple ring bands with dark gaps ──
+def gen_tunnel_color_table():
+    lines = ["; Tunnel color table: 256 words, blue/purple rings with dark gaps"]
+    lines.append("tunnel_color_table:")
+    colors = []
+    for i in range(256):
+        t = i / 256.0
+        # Create ring bands: bright peaks with dark gaps
+        band = math.sin(2 * math.pi * t * 4) ** 2  # 4 bright bands
+        if band < 0.3:
+            band = 0  # dark gap
+        else:
+            band = (band - 0.3) / 0.7  # normalize bright part
+        # Color: blue/purple gradient
+        r = min(15, max(0, int(band * 8 + 0.5)))
+        g = min(15, max(0, int(band * 2 + 0.5)))
+        b = min(15, max(0, int(band * 15 + 0.5)))
+        colors.append((r << 8) | (g << 4) | b)
+    for i in range(0, 256, 8):
+        vals = [f"${colors[i+j]:04X}" for j in range(8)]
+        lines.append(f"\tdc.w\t{','.join(vals)}")
+    return "\n".join(lines)
+
+# ── Stripe pattern (48 bytes) — 4px on / 4px off vertical stripes ──
+def gen_stripe_pattern():
+    lines = ["; Stripe pattern: 48 bytes, 4px on / 4px off vertical stripes"]
+    lines.append("stripe_pattern:")
+    # 48 bytes = 384 pixels. Pattern: 4 on, 4 off = $F0 repeated
+    vals = []
+    for i in range(48):
+        vals.append("$F0")
+    for i in range(0, 48, 16):
+        chunk = vals[i:i+16]
+        lines.append(f"\tdc.b\t{','.join(chunk)}")
+    return "\n".join(lines)
+
+# ── Octahedron vertices (6 × 3 words) ──
+def gen_octa_vertices():
+    R = 50
+    verts = [
+        (0, -R, 0),   # top
+        (0, R, 0),    # bottom
+        (-R, 0, 0),   # left
+        (R, 0, 0),    # right
+        (0, 0, -R),   # front
+        (0, 0, R),    # back
+    ]
+    lines = ["; Octahedron vertices: 6 x (x.w, y.w, z.w), radius 50"]
+    lines.append("octa_vertices:")
+    for x, y, z in verts:
+        lines.append(f"\tdc.w\t{x},{y},{z}")
+    return "\n".join(lines)
+
+# ── Octahedron edges (12 × 2 bytes) ──
+def gen_octa_edges():
+    # Each non-polar vertex connects to both poles and to its 2 equatorial neighbors
+    # Top=0, Bottom=1, Left=2, Right=3, Front=4, Back=5
+    edges = [
+        (0, 2), (0, 3), (0, 4), (0, 5),  # top to equator
+        (1, 2), (1, 3), (1, 4), (1, 5),  # bottom to equator
+        (2, 4), (4, 3), (3, 5), (5, 2),  # equatorial ring
+    ]
+    lines = ["; Octahedron edges: 12 x (v0.b, v1.b)"]
+    lines.append("octa_edges:")
+    vals = []
+    for v0, v1 in edges:
+        vals.append(f"${v0:02X},${v1:02X}")
+    lines.append(f"\tdc.b\t{','.join(vals)}")
+    return "\n".join(lines)
+
 # ── Main ──
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "tables.i"
@@ -383,6 +483,11 @@ def main():
         gen_cube_targets(),
         gen_sphere_targets(),
         gen_helix_targets(),
+        gen_bounce_sprite(),
+        gen_tunnel_color_table(),
+        gen_stripe_pattern(),
+        gen_octa_vertices(),
+        gen_octa_edges(),
     ]
     with open(out, "w") as f:
         f.write("\n\n".join(parts) + "\n")

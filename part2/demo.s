@@ -15,7 +15,19 @@ SPR2_DATA	equ	$3B110		; sprite 2 data
 SPR4_DATA	equ	$3B220		; sprite 4 data
 SPR6_DATA	equ	$3B330		; sprite 6 data
 NULL_SPR	equ	$3B440		; 4 bytes null sprite
-STAR_ARRAY	equ	$3B450		; 120*10 = 1200 bytes
+; Bouncing logo sprites (2 attached pairs = 32px wide logo)
+; Attached pair: spr1+spr0 share, spr3+spr2 share
+; We use sprites 1,3 as independent bouncing logos
+LOGO_SPR1	equ	$3B450		; sprite 1 data (left half of logo)
+LOGO_SPR3	equ	$3B560		; sprite 3 data (right half of logo)
+STAR_ARRAY	equ	$3B680		; 120*10 = 1200 bytes (moved down)
+; Scratch buffers (in gap $3B900-$40000)
+TUNNEL_COLORS	equ	$3BC00		; 108 words (216 bytes)
+STAR_COLORS	equ	$3BCD8		; 216 words (432 bytes)
+GLITCH_OFFSETS	equ	$3BE88		; 108 longs (432 bytes)
+PROJECTED_VERTS	equ	$3C038		; 12 words (24 bytes)
+BPL1_MIDDLE	equ	$40C00		; BPLANE1 + 64*48 (start of middle zone in BPL1)
+
 BPLANE1		equ	$40000		; bitplane 1: logo + scroll (48*256 = 12 KB)
 BPLANE2		equ	$43000		; bitplane 2: stars (48*256 = 12 KB)
 
@@ -77,12 +89,50 @@ SCROLL_START	equ	$D8		; line 216
 SCROLL_LINES	equ	40		; 5 char rows of 8
 
 ; Scrolltext
-SCROLL_AREA	equ	BPLANE1+(SCROLL_START-LOGO_START)*BPWIDTH
+SCROLL_BUF	equ	$46000		; after BPLANE2, before demo code ($49000)
+SCROLL_BUF_STRIDE equ	256		; power of 2: row offset = font_row << 8
+SCROLL_TEXT_LEN	equ	177		; chars in scroll_text (excluding $FF)
+SCROLL_TOTAL_PX	equ	SCROLL_TEXT_LEN*8 ; 1416 pixels before wrap
+SCROLL_SINE_SHIFT equ	1		; halve sine amplitude (max ~24 bytes)
 SCROLL_SPEED	equ	1		; pixels per frame
 
 ; Beat flash
 BEAT_THRESHOLD	equ	40
 BEAT_JUMP	equ	20
+
+; Bouncing logo sprite
+BOUNCE_W	equ	16		; pixels wide per sprite
+BOUNCE_H	equ	16		; pixels tall
+BOUNCE_XMIN	equ	$41		; hardware H min (left border)
+BOUNCE_XMAX	equ	$1B1		; hardware H max - 16px
+BOUNCE_YMIN	equ	$2C		; top of display
+BOUNCE_YMAX	equ	$FC		; bottom - 16 lines (stay above scroll)
+BOUNCE_PULSE_DECAY equ	3	; how fast pulsation decays
+
+; Middle zone BPL1 effect cycling
+MID_EFFECT_TIME	equ	300		; frames per mid effect (6 sec)
+MID_WAVEFORM	equ	0
+MID_MOIRE	equ	1
+MID_WIREFRAME	equ	2
+NUM_MID_EFFECTS	equ	3
+MIDDLE_LINES	equ	108		; lines in middle zone
+
+; Blitter registers
+DMACONR		equ	$002
+BLTCON0		equ	$040
+BLTCON1		equ	$042
+BLTAFWM		equ	$044
+BLTALWM		equ	$046
+BLTAPTH		equ	$050
+BLTAPTL		equ	$052
+BLTDPTH		equ	$054
+BLTDPTL		equ	$056
+BLTSIZE		equ	$058
+BLTBPTH		equ	$04C
+BLTBPTL		equ	$04E
+BLTAMOD		equ	$064
+BLTBMOD		equ	$062
+BLTDMOD		equ	$066
 
 ; Custom chip registers
 CUSTOM		equ	$DFF000
@@ -159,11 +209,12 @@ Start:
 	; Init sprites
 	bsr.w	InitSprites
 
-	; Init scrolltext
-	clr.w	scroll_charpos
-	clr.w	scroll_bitcount
-	lea	scroll_text(pc),a0
-	move.l	a0,scroll_ptr
+	; Init bouncing logo sprites
+	bsr.w	InitBounceLogo
+
+	; Init scrolltext (pre-render into SCROLL_BUF)
+	bsr.w	PreRenderScroll
+	clr.w	scroll_pixel_pos
 
 	; Init shape cycling
 	clr.w	effect_state
@@ -216,14 +267,29 @@ Start:
 	move.w	#$C000,INTENA(a6)
 
 ;==========================================================
-; Main loop
+; Main loop — new blitter pipeline with 6 effects
 ;==========================================================
 MainLoop:
 	bsr.w	WaitVBL
+
+	; === Step 1: Start BPL2 clear (blitter runs in parallel) ===
+	bsr.w	BlitClearBPL2
+
+	; === Step 2: CPU work while BPL2 clears ===
 	bsr.w	UpdateAllChannelEnergy
 	bsr.w	DetectBeat
 	bsr.w	UpdateEqualizer
+	bsr.w	UpdateTunnelZoom
+	bsr.w	UpdateRainbowStarColors
+	bsr.w	PrepareGlitchOffsets
 
+	; === Step 3: Wait for BPL2 clear ===
+	bsr.w	WaitBlitter
+
+	; === Step 4: Start BPL1 middle clear (blitter runs in parallel) ===
+	bsr.w	BlitClearBPL1Middle
+
+	; === Step 5: CPU work while BPL1 middle clears ===
 	; Swap copper buffers
 	move.l	cop_front(pc),d0
 	move.l	cop_back(pc),d1
@@ -232,7 +298,7 @@ MainLoop:
 	move.l	cop_front(pc),COP1LCH(a6)
 	move.w	COPJMP1(a6),d0
 
-	; State dispatch: tunnel / morph / display
+	; State dispatch: tunnel / morph / display (star plotting on BPL2)
 	move.w	effect_state(pc),d0
 	cmp.w	#EFFECT_MORPH,d0
 	beq.w	.doMorph
@@ -260,14 +326,41 @@ MainLoop:
 	bsr.w	StartNextMorph
 .stateEnd:
 
-	; Update scrolltext
+	; === Step 6: Wait for BPL1 middle clear ===
+	bsr.w	WaitBlitter
+
+	; === Step 7: Middle zone BPL1 effect (waveform/moiré/wireframe) ===
+	move.w	mid_effect(pc),d0
+	cmp.w	#MID_MOIRE,d0
+	beq.s	.doMoire
+	cmp.w	#MID_WIREFRAME,d0
+	beq.s	.doWire
+	; Default: waveform (CPU)
+	bsr.w	DrawWaveform
+	bra.s	.midDone
+.doMoire:
+	bsr.w	BlitMoirePass1
+	bsr.w	BlitMoirePass2
+	bsr.w	WaitBlitter		; wait for moiré to finish
+	bra.s	.midDone
+.doWire:
+	bsr.w	DrawWireframe
+.midDone:
+
+	; === Step 8: Start scroll blit (runs in parallel) ===
+	; (BlitScrollLeft called from UpdateScrolltext)
+
+	; Update bouncing logo sprites
+	bsr.w	UpdateBounceLogo
+
+	; Update scrolltext (includes blitter scroll)
 	bsr.w	UpdateScrolltext
 
 	; Build next frame into back buffer
 	move.l	cop_back(pc),a0
 	bsr.w	BuildCopper
 
-	; Advance animation phases
+	; === Advance animation phases ===
 	addq.w	#3,plasma_phase1
 	and.w	#$FF,plasma_phase1
 	addq.w	#1,plasma_phase2
@@ -278,6 +371,68 @@ MainLoop:
 	and.w	#$FF,sine_phase
 	addq.w	#2,orbit_phase
 	and.w	#$FF,orbit_phase
+
+	; Advance new effect phases
+	addq.w	#2,ring_phase
+	and.w	#$FF,ring_phase
+
+	; rainbow_star_phase speed driven by treble energy (ch2+ch3)
+	lea	eq_energy(pc),a0
+	move.w	4(a0),d0		; ch2
+	add.w	6(a0),d0		; ch3
+	lsr.w	#5,d0
+	addq.w	#1,d0			; min speed 1
+	add.w	d0,rainbow_star_phase
+	and.w	#$FF,rainbow_star_phase
+
+	; Advance wave phases (each channel at different speed)
+	lea	wave_phases(pc),a0
+	addq.w	#4,(a0)+
+	addq.w	#3,(a0)+
+	addq.w	#2,(a0)+
+	addq.w	#1,(a0)+
+	lea	wave_phases(pc),a0
+	and.w	#$FF,(a0)+
+	and.w	#$FF,(a0)+
+	and.w	#$FF,(a0)+
+	and.w	#$FF,(a0)+
+
+	; Advance moiré shift (oscillate 1..15)
+	move.w	moire_shift(pc),d0
+	add.w	moire_dir(pc),d0
+	cmp.w	#15,d0
+	blt.s	.mshOk1
+	move.w	#-1,moire_dir
+	move.w	#15,d0
+.mshOk1:
+	cmp.w	#1,d0
+	bge.s	.mshOk2
+	move.w	#1,moire_dir
+	moveq	#1,d0
+.mshOk2:
+	move.w	d0,moire_shift
+
+	; Advance wireframe angle (speed driven by combined_energy)
+	move.w	combined_energy(pc),d0
+	lsr.w	#4,d0
+	addq.w	#1,d0
+	add.w	d0,wire_angle
+	and.w	#$FF,wire_angle
+
+	; Mid effect cycling (every MID_EFFECT_TIME frames)
+	addq.w	#1,mid_effect_timer
+	move.w	mid_effect_timer(pc),d0
+	cmp.w	#MID_EFFECT_TIME,d0
+	blt.s	.noMidSwitch
+	clr.w	mid_effect_timer
+	move.w	mid_effect(pc),d0
+	addq.w	#1,d0
+	cmp.w	#NUM_MID_EFFECTS,d0
+	blt.s	.midNoWrap
+	moveq	#0,d0
+.midNoWrap:
+	move.w	d0,mid_effect
+.noMidSwitch:
 
 	; Decrement flash timer
 	move.w	flash_timer(pc),d0
@@ -312,15 +467,35 @@ flash_timer:	dc.w	0
 eq_energy:	dc.w	0,0,0,0
 combined_energy: dc.w	0
 last_combined:	dc.w	0
-scroll_charpos:	dc.w	0
-scroll_bitcount: dc.w	0
-scroll_ptr:	dc.l	0
+scroll_pixel_pos: dc.w	0
 rot_sin_y:	dc.w	0
 rot_cos_y:	dc.w	0
 rot_sin_x:	dc.w	0
 rot_cos_x:	dc.w	0
 bar_phase:	dc.w	0
 bar_y:		dc.w	153,153,153,153
+
+; Bouncing logo 1 variables (hardware coords)
+bounce_x:	dc.w	$80		; current X (hardware sprite H)
+bounce_y:	dc.w	$60		; current Y (hardware sprite V)
+bounce_dx:	dc.w	1		; X velocity (+1 or -1)
+bounce_dy:	dc.w	1		; Y velocity (+1 or -1)
+bounce_pulse:	dc.w	0		; pulsation intensity (0-15, decays)
+; Bouncing logo 2 (sprite 3) — independent movement
+bounce2_x:	dc.w	$120
+bounce2_y:	dc.w	$90
+bounce2_dx:	dc.w	-1
+bounce2_dy:	dc.w	1
+
+; New effect variables
+mid_effect:	dc.w	0		; 0=waveform, 1=moiré, 2=wireframe
+mid_effect_timer: dc.w	0		; frames in current effect
+ring_phase:	dc.w	0		; tunnel zoom animation phase
+rainbow_star_phase: dc.w 0		; per-line star color phase
+wave_phases:	dc.w	0,0,0,0		; per-channel waveform phase
+moire_shift:	dc.w	1		; current XOR shift (1-15)
+moire_dir:	dc.w	1		; +1 or -1
+wire_angle:	dc.w	0		; wireframe rotation angle
 
 ;==========================================================
 ; WaitVBL — wait for line 300
@@ -335,6 +510,27 @@ WaitVBL:
 	cmp.l	#300<<8,d0
 	beq.s	.wv2
 	rts
+
+;==========================================================
+; WaitBlitter — wait for blitter to finish
+;==========================================================
+WaitBlitter:
+.wb:	btst	#6,DMACONR(a6)
+	bne.s	.wb
+	rts
+
+;==========================================================
+; BlitClearBPL2 — clear entire starfield bitplane via blitter
+; Does NOT wait for completion (caller should WaitBlitter later)
+;==========================================================
+BlitClearBPL2:
+	bsr.s	WaitBlitter		; ensure previous blit done
+	clr.w	BLTDMOD(a6)		; no modulo
+	move.l	#$01000000,BLTCON0(a6)	; D only, minterm=0 (clear)
+	move.l	#BPLANE2,BLTDPTH(a6)
+	move.w	#(256<<6)|24,BLTSIZE(a6) ; 256 lines × 24 words → starts blit
+	rts
+
 
 ;==========================================================
 ; UpdateAllChannelEnergy — read 4 channels, attack/decay
@@ -492,25 +688,6 @@ InitStars:
 	rts
 
 ;==========================================================
-; EraseStar
-;==========================================================
-EraseStar:
-	move.w	STAR_OPX(a2),d0
-	cmp.w	#$FFFF,d0
-	beq.s	.done
-	move.w	STAR_OPY(a2),d1
-	add.w	d1,d1
-	move.w	0(a4,d1.w),d4
-	move.w	d0,d2
-	lsr.w	#3,d2
-	add.w	d2,d4
-	move.w	d0,d2
-	not.w	d2
-	and.w	#7,d2
-	bclr	d2,0(a0,d4.w)
-.done:	rts
-
-;==========================================================
 ; ProjectAndPlot
 ;==========================================================
 ProjectAndPlot:
@@ -570,7 +747,7 @@ UpdateStars:
 
 	move.w	#NUM_STARS-1,d7
 .starLoop:
-	bsr.w	EraseStar
+	; (EraseStar removed — BPL2 cleared by blitter before star loop)
 	move.w	STAR_SZ(a2),d0
 	sub.w	current_zspeed(pc),d0
 	cmp.w	#MIN_Z,d0
@@ -671,7 +848,7 @@ ShapeStars:
 	move.w	#NUM_STARS-1,d7
 
 .starLoop:
-	bsr.w	EraseStar
+	; (EraseStar removed — BPL2 cleared by blitter before star loop)
 	move.w	effect_state(pc),d0
 	cmp.w	#EFFECT_MORPH,d0
 	beq.s	.ease
@@ -780,81 +957,85 @@ ShapeStars:
 	rts
 
 ;==========================================================
-; UpdateScrolltext — shift left 1px/frame, render chars
+; UpdateScrolltext — advance pixel counter (copper handles display)
 ;==========================================================
 UpdateScrolltext:
-	movem.l	d2-d5/a2-a3,-(sp)
-
-	; Shift all 40 lines of scroll area left by 1 pixel
-	lea	SCROLL_AREA,a0
-	moveq	#SCROLL_LINES-1,d5
-.shiftLine:
-	; Shift 24 words left by 1 pixel via ROXL chain
-	; Walk from rightmost word to leftmost, carry propagates
-	lea	BPWIDTH-2(a0),a2	; point to last word
-	moveq	#23,d3
-	andi	#$FE,ccr		; clear X flag
-.shiftWord:
-	roxl.w	(a2)
-	subq.l	#2,a2
-	dbf	d3,.shiftWord
-
-	lea	BPWIDTH(a0),a0
-	dbf	d5,.shiftLine
-
-	; Every 8 frames, render next char at right edge
-	move.w	scroll_bitcount(pc),d0
-	addq.w	#1,d0
-	cmp.w	#8,d0
-	blt.s	.noChar
-	clr.w	d0
-	bsr.w	DrawScrollChar
-.noChar:
-	move.w	d0,scroll_bitcount
-
-	movem.l	(sp)+,d2-d5/a2-a3
+	move.w	scroll_pixel_pos(pc),d0
+	addq.w	#SCROLL_SPEED,d0
+	cmp.w	#SCROLL_TOTAL_PX,d0
+	blt.s	.noWrap
+	sub.w	#SCROLL_TOTAL_PX,d0
+.noWrap:
+	move.w	d0,scroll_pixel_pos
 	rts
 
 ;==========================================================
-; DrawScrollChar — render 8x8 char at right edge of scroll
+; PreRenderScroll — render entire scroll text into wide bitmap
+; Buffer layout: 256 bytes/row × 8 rows, 1 byte per char column
 ;==========================================================
-DrawScrollChar:
-	movem.l	d2/a2-a3,-(sp)
+PreRenderScroll:
+	movem.l	d2-d4/a2-a3,-(sp)
 
-	; Get next char
-	move.l	scroll_ptr(pc),a2
+	; Clear buffer (256 × 8 = 2048 bytes)
+	lea	SCROLL_BUF,a0
+	move.w	#(2048/4)-1,d0
+.clrBuf:
+	clr.l	(a0)+
+	dbf	d0,.clrBuf
+
+	; For each char in scroll_text: write font bytes into buffer columns
+	lea	scroll_text(pc),a2	; source text
+	lea	font_data(pc),a3	; font base
+	moveq	#0,d2			; char index (column)
+
+.charLoop:
 	moveq	#0,d0
 	move.b	(a2)+,d0
 	cmp.b	#$FF,d0			; end marker?
-	bne.s	.notEnd
-	lea	scroll_text(pc),a2	; wrap around
-	move.b	(a2)+,d0
-.notEnd:
-	move.l	a2,scroll_ptr
+	beq.s	.doneChars
 
 	; Font lookup: (char - 32) * 8
 	sub.w	#32,d0
-	bpl.s	.charOk
-	moveq	#0,d0			; below space = space
-.charOk:
-	cmp.w	#96,d0
-	blt.s	.charInRange
+	bpl.s	.cOk
 	moveq	#0,d0
-.charInRange:
-	lsl.w	#3,d0			; *8
-	lea	font_data(pc),a3
-	add.w	d0,a3			; a3 = glyph data
+.cOk:
+	cmp.w	#96,d0
+	blt.s	.cInRange
+	moveq	#0,d0
+.cInRange:
+	lsl.w	#3,d0			; *8 bytes per glyph
+	lea	0(a3,d0.w),a0		; glyph pointer
 
-	; Write 8 rows into rightmost byte of each scroll line
-	lea	SCROLL_AREA,a0
-	add.w	#BPWIDTH-1,a0		; rightmost byte
-	moveq	#7,d2
-.charRow:
-	move.b	(a3)+,(a0)
-	lea	BPWIDTH(a0),a0
-	dbf	d2,.charRow
+	; Write 8 rows: row R gets byte at SCROLL_BUF + R*256 + char_index
+	lea	SCROLL_BUF,a1
+	add.w	d2,a1			; column offset
+	moveq	#7,d1
+.rowLoop:
+	move.b	(a0)+,(a1)
+	lea	SCROLL_BUF_STRIDE(a1),a1
+	dbf	d1,.rowLoop
 
-	movem.l	(sp)+,d2/a2-a3
+	addq.w	#1,d2
+	bra.s	.charLoop
+
+.doneChars:
+	; Copy first 78 bytes of each row to positions TEXT_LEN..TEXT_LEN+77
+	; for seamless wrap
+	moveq	#7,d3			; 8 rows
+	lea	SCROLL_BUF,a0
+.wrapRow:
+	move.w	d2,d4			; dest offset = TEXT_LEN
+	moveq	#77,d1			; 78 bytes to copy (0..77)
+	moveq	#0,d0			; source offset
+.wrapByte:
+	move.b	0(a0,d0.w),0(a0,d4.w)
+	addq.w	#1,d0
+	addq.w	#1,d4
+	dbf	d1,.wrapByte
+	lea	SCROLL_BUF_STRIDE(a0),a0
+	dbf	d3,.wrapRow
+
+	movem.l	(sp)+,d2-d4/a2-a3
 	rts
 
 ;==========================================================
@@ -899,6 +1080,87 @@ SprInitTab:
 	dc.w	SPR_H2
 	dc.l	SPR6_DATA
 	dc.w	SPR_H3
+
+;==========================================================
+; InitBounceLogo — fill LOGO_SPR1 with "D" glyph data
+; Sprite format: POS word, CTL word, then 16 rows of (dataA, dataB)
+;==========================================================
+InitBounceLogo:
+	; Fill sprite 1 (bouncing D)
+	lea	LOGO_SPR1,a0
+	move.w	bounce_y(pc),d0
+	move.w	bounce_x(pc),d1
+
+	; POS: VSTART[7:0]<<8 | HSTART[8:1]
+	move.w	d0,d2
+	and.w	#$FF,d2
+	lsl.w	#8,d2
+	move.w	d1,d3
+	lsr.w	#1,d3
+	or.w	d3,d2
+	move.w	d2,(a0)+		; POS
+
+	; CTL: VSTOP[7:0]<<8 | VSTART[8]<<2 | VSTOP[8]<<1 | HSTART[0]
+	move.w	d0,d2
+	add.w	#BOUNCE_H,d2		; VSTOP
+	move.w	d2,d3
+	and.w	#$FF,d3
+	lsl.w	#8,d3
+	btst	#8,d0			; VSTART bit 8
+	beq.s	.noVS8
+	or.w	#$04,d3
+.noVS8:	btst	#8,d2			; VSTOP bit 8
+	beq.s	.noVE8
+	or.w	#$02,d3
+.noVE8:	btst	#0,d1			; HSTART bit 0
+	beq.s	.noH0
+	or.w	#$01,d3
+.noH0:	move.w	d3,(a0)+		; CTL
+
+	; Copy 16 rows of glyph data
+	lea	bounce_glyph(pc),a1
+	moveq	#15,d0
+.glyphCopy:
+	move.l	(a1)+,(a0)+
+	dbf	d0,.glyphCopy
+
+	; Terminator
+	clr.l	(a0)
+
+	; Also init sprite 3 with same data (second bouncer)
+	lea	LOGO_SPR3,a0
+	; Start at different position
+	move.w	#$90,d0			; Y
+	move.w	#$120,d1		; X
+	move.w	d0,d2
+	and.w	#$FF,d2
+	lsl.w	#8,d2
+	move.w	d1,d3
+	lsr.w	#1,d3
+	or.w	d3,d2
+	move.w	d2,(a0)+
+	move.w	d0,d2
+	add.w	#BOUNCE_H,d2
+	move.w	d2,d3
+	and.w	#$FF,d3
+	lsl.w	#8,d3
+	btst	#8,d0
+	beq.s	.noVS8b
+	or.w	#$04,d3
+.noVS8b: btst	#8,d2
+	beq.s	.noVE8b
+	or.w	#$02,d3
+.noVE8b: btst	#0,d1
+	beq.s	.noH0b
+	or.w	#$01,d3
+.noH0b:	move.w	d3,(a0)+
+	lea	bounce_glyph(pc),a1
+	moveq	#15,d0
+.glyphCopy2:
+	move.l	(a1)+,(a0)+
+	dbf	d0,.glyphCopy2
+	clr.l	(a0)
+	rts
 
 ;==========================================================
 ; UpdateEqualizer — update sprite POS/CTL from energy
@@ -946,6 +1208,115 @@ EQSpriteCtrl:
 	dc.w	SPR_H3>>1
 
 ;==========================================================
+; UpdateBounceLogo — DVD-style bounce + music pulsation
+; Updates POS/CTL words of LOGO_SPR1 and LOGO_SPR3
+;==========================================================
+UpdateBounceLogo:
+	; --- Pulsation: on beat, spike pulse; otherwise decay ---
+	move.w	bounce_pulse(pc),d0
+	move.w	flash_timer(pc),d1
+	tst.w	d1
+	beq.s	.noPulse
+	move.w	#15,d0
+.noPulse:
+	tst.w	d0
+	beq.s	.pulseOk
+	subq.w	#1,d0
+.pulseOk:
+	move.w	d0,bounce_pulse
+
+	; Speed = 1 + (combined_energy >> 5)
+	move.w	combined_energy(pc),d4
+	lsr.w	#5,d4
+	addq.w	#1,d4
+
+	; --- Bounce sprite 1 ---
+	lea	bounce_x(pc),a1
+	lea	LOGO_SPR1,a0
+	bsr.s	.bounceOne
+
+	; --- Bounce sprite 3 (independent) ---
+	lea	bounce2_x(pc),a1
+	lea	LOGO_SPR3,a0
+	bsr.s	.bounceOne
+	rts
+
+	; --- Bounce one sprite ---
+	; In: a0=sprite data, a1=ptr to (x,y,dx,dy), d4=speed
+.bounceOne:
+	move.w	(a1),d0			; X
+	move.w	2(a1),d1		; Y
+	move.w	4(a1),d2		; dX
+	move.w	6(a1),d3		; dY
+
+	; Apply velocity * speed
+	move.w	d2,d5
+	muls	d4,d5
+	add.w	d5,d0
+	move.w	d3,d5
+	muls	d4,d5
+	add.w	d5,d1
+
+	; Bounce X
+	cmp.w	#BOUNCE_XMIN,d0
+	bge.s	.xMinOk
+	move.w	#BOUNCE_XMIN,d0
+	neg.w	d2
+.xMinOk:
+	cmp.w	#BOUNCE_XMAX,d0
+	ble.s	.xMaxOk
+	move.w	#BOUNCE_XMAX,d0
+	neg.w	d2
+.xMaxOk:
+	; Bounce Y
+	cmp.w	#BOUNCE_YMIN,d1
+	bge.s	.yMinOk
+	move.w	#BOUNCE_YMIN,d1
+	neg.w	d3
+.yMinOk:
+	cmp.w	#BOUNCE_YMAX,d1
+	ble.s	.yMaxOk
+	move.w	#BOUNCE_YMAX,d1
+	neg.w	d3
+.yMaxOk:
+	; Store
+	move.w	d0,(a1)
+	move.w	d1,2(a1)
+	move.w	d2,4(a1)
+	move.w	d3,6(a1)
+
+	; Fall through to write POS/CTL
+	; --- write POS/CTL at (a0) for pos d0=H, d1=V ---
+	move.w	d1,d5			; VSTART
+	move.w	d1,d6
+	add.w	#BOUNCE_H,d6		; VSTOP
+
+	; POS: VSTART[7:0]<<8 | HSTART[8:1]
+	move.w	d5,d7
+	and.w	#$FF,d7
+	lsl.w	#8,d7
+	move.w	d0,d3
+	lsr.w	#1,d3
+	or.w	d3,d7
+	move.w	d7,(a0)
+
+	; CTL: VSTOP[7:0]<<8 | VSTART[8]<<2 | VSTOP[8]<<1 | HSTART[0]
+	move.w	d6,d7
+	and.w	#$FF,d7
+	lsl.w	#8,d7
+	btst	#8,d5
+	beq.s	.wNoVS8
+	or.w	#$04,d7
+.wNoVS8: btst	#8,d6
+	beq.s	.wNoVE8
+	or.w	#$02,d7
+.wNoVE8: btst	#0,d0
+	beq.s	.wNoH0
+	or.w	#$01,d7
+.wNoH0:	move.w	d7,2(a0)
+	rts
+
+;==========================================================
 ; DrawLogo — copy logo_data into top of BPL1
 ;==========================================================
 DrawLogo:
@@ -955,6 +1326,455 @@ DrawLogo:
 	move.w	#(48*32/4)-1,d0
 .copy:	move.l	(a0)+,(a1)+
 	dbf	d0,.copy
+	rts
+
+;==========================================================
+; BlitClearBPL1Middle — clear middle zone of BPL1 via blitter
+; 108 lines × 24 words (48 bytes/line)
+; Does NOT wait for completion
+;==========================================================
+BlitClearBPL1Middle:
+	bsr.w	WaitBlitter
+	clr.w	BLTDMOD(a6)
+	move.l	#$01000000,BLTCON0(a6)	; D only, minterm=0
+	move.l	#BPL1_MIDDLE,BLTDPTH(a6)
+	move.w	#(MIDDLE_LINES<<6)|24,BLTSIZE(a6)
+	rts
+
+;==========================================================
+; UpdateTunnelZoom — compute 108 ring colors
+; Writes to TUNNEL_COLORS buffer (108 words)
+;==========================================================
+UpdateTunnelZoom:
+	movem.l	d2-d5/a2-a3,-(sp)
+	lea	TUNNEL_COLORS,a0
+	lea	tunnel_color_table(pc),a2
+	lea	signed_sine_table(pc),a3
+
+	; center_y orbits via sine
+	move.w	ring_phase(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	(a3,d0.w),d2		; signed sine -127..+127
+	asr.w	#2,d2			; scale to -31..+31
+	add.w	#54,d2			; center at line 54 of 108
+
+	; spacing shrinks with bass energy: 4 - (combined>>5), min 1
+	move.w	combined_energy(pc),d3
+	lsr.w	#5,d3
+	move.w	#4,d4
+	sub.w	d3,d4
+	cmp.w	#1,d4
+	bge.s	.spacOk
+	moveq	#1,d4
+.spacOk:
+
+	; ring_phase offset for animation
+	move.w	ring_phase(pc),d5
+
+	moveq	#0,d3			; line counter
+.tLoop:
+	; dist = abs(line - center_y)
+	move.w	d3,d0
+	sub.w	d2,d0
+	bpl.s	.tNoNeg
+	neg.w	d0
+.tNoNeg:
+	; index = (dist * spacing + ring_phase) & $FF
+	mulu	d4,d0
+	add.w	d5,d0
+	and.w	#$FF,d0
+	add.w	d0,d0			; word index
+	move.w	(a2,d0.w),(a0)+
+
+	addq.w	#1,d3
+	cmp.w	#MIDDLE_LINES,d3
+	blt.s	.tLoop
+
+	movem.l	(sp)+,d2-d5/a2-a3
+	rts
+
+;==========================================================
+; UpdateRainbowStarColors — compute 108 COLOR02/03 pairs
+; Writes to STAR_COLORS buffer (108 × 2 words = 216 words)
+;==========================================================
+UpdateRainbowStarColors:
+	movem.l	d2-d3/a2,-(sp)
+	lea	STAR_COLORS,a0
+	lea	rainbow_table(pc),a2
+
+	move.w	rainbow_star_phase(pc),d2
+
+	moveq	#0,d3
+.rsLoop:
+	move.w	d3,d0
+	add.w	d2,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	(a2,d0.w),d0		; COLOR02 = rainbow
+	move.w	d0,(a0)+		; store COLOR02
+	or.w	#$888,d0		; brighter overlap
+	move.w	d0,(a0)+		; store COLOR03
+
+	addq.w	#1,d3
+	cmp.w	#MIDDLE_LINES,d3
+	blt.s	.rsLoop
+
+	movem.l	(sp)+,d2-d3/a2
+	rts
+
+;==========================================================
+; PrepareGlitchOffsets — LFSR random BPL2 addresses
+; Only when flash_timer > 0. Writes to GLITCH_OFFSETS (108 longs)
+;==========================================================
+PrepareGlitchOffsets:
+	move.w	flash_timer(pc),d0
+	beq.s	.noGlitch
+	movem.l	d2-d3,-(sp)
+	lea	GLITCH_OFFSETS,a0
+	move.w	#MIDDLE_LINES-1,d3
+.gLoop:
+	bsr.w	LFSRNext
+	; Random offset within BPLANE2 (12KB = $3000)
+	move.w	d2,d0
+	and.w	#$1FFF,d0		; 0-8191
+	; Force even
+	and.w	#$FFFE,d0
+	ext.l	d0
+	add.l	#BPLANE2,d0
+	move.l	d0,(a0)+
+	dbf	d3,.gLoop
+	movem.l	(sp)+,d2-d3
+.noGlitch:
+	rts
+
+;==========================================================
+; DrawWaveform — plot 4-channel sine waves into BPL1 middle
+; 108 x-positions, 4 channels overlaid
+;==========================================================
+DrawWaveform:
+	movem.l	d2-d7/a2-a4,-(sp)
+	lea	BPL1_MIDDLE,a0
+	lea	yoffset_table(pc),a4
+	lea	signed_sine_table(pc),a3
+	lea	eq_energy(pc),a2
+
+	moveq	#3,d7			; channel counter
+.wfChLoop:
+	move.w	d7,d0
+	add.w	d0,d0
+	move.w	(a2,d0.w),d6		; channel energy (amplitude)
+	lsr.w	#1,d6			; scale down
+	cmp.w	#50,d6
+	ble.s	.ampOk
+	move.w	#50,d6
+.ampOk:
+	tst.w	d6
+	beq.s	.wfChSkip
+
+	; Frequency: channel 0=fast, 3=slow
+	move.w	d7,d0
+	add.w	d0,d0
+	lea	wave_phases(pc),a1
+	move.w	(a1,d0.w),d5		; phase for this channel
+
+	moveq	#0,d4			; x counter (0..107)
+.wfXLoop:
+	; y = 54 + (sin(x*freq + phase) * amplitude) >> 7
+	move.w	d4,d0
+	move.w	#3,d1
+	sub.w	d7,d1			; freq multiplier: ch0=3, ch1=2, ch2=1, ch3=0
+	addq.w	#1,d1			; ch0=4, ch1=3, ch2=2, ch3=1
+	mulu	d1,d0
+	add.w	d5,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	(a3,d0.w),d0		; signed sine -127..+127
+	muls	d6,d0
+	asr.l	#7,d0
+	add.w	#54,d0			; center Y in middle zone
+
+	; Clamp to 0..107
+	bpl.s	.wyOk1
+	moveq	#0,d0
+.wyOk1:	cmp.w	#107,d0
+	ble.s	.wyOk2
+	move.w	#107,d0
+.wyOk2:
+	; Plot pixel at (d4, d0) in BPL1 middle
+	; byte_offset = y*48 + (x>>3)
+	add.w	d0,d0
+	move.w	(a4,d0.w),d1		; y*48 from yoffset table
+	move.w	d4,d0
+	lsr.w	#3,d0
+	add.w	d0,d1			; byte offset
+
+	move.w	d4,d0
+	not.w	d0
+	and.w	#7,d0			; bit index
+	bset	d0,(a0,d1.w)
+
+	addq.w	#1,d4
+	cmp.w	#MIDDLE_LINES,d4
+	blt.s	.wfXLoop
+
+.wfChSkip:
+	dbf	d7,.wfChLoop
+
+	movem.l	(sp)+,d2-d7/a2-a4
+	rts
+
+;==========================================================
+; BlitMoirePass1 — fill BPL1 middle with stripe pattern (A→D)
+;==========================================================
+BlitMoirePass1:
+	bsr.w	WaitBlitter
+	move.w	#$FFFF,BLTAFWM(a6)
+	move.w	#$FFFF,BLTALWM(a6)
+	clr.w	BLTAMOD(a6)
+	clr.w	BLTDMOD(a6)
+	move.l	#$09F00000,BLTCON0(a6)	; A→D, minterm=$F0 (copy A)
+	lea	stripe_pattern(pc),a1
+	move.l	a1,BLTAPTH(a6)
+	move.l	#BPL1_MIDDLE,BLTDPTH(a6)
+	; 108 lines × 24 words — but source is only 48 bytes
+	; We repeat by setting AMOD = -48 (wrap every line)
+	move.w	#-48,BLTAMOD(a6)	; source wraps each line
+	move.w	#(MIDDLE_LINES<<6)|24,BLTSIZE(a6)
+	rts
+
+;==========================================================
+; BlitMoirePass2 — XOR shifted copy (A XOR B → D)
+;==========================================================
+BlitMoirePass2:
+	bsr.w	WaitBlitter
+	; Shift amount from moire_shift
+	move.w	moire_shift(pc),d0
+	and.w	#$F,d0
+	ror.w	#4,d0			; shift into ASH position (bits 15-12)
+	or.w	#$0DE0,d0		; A+B→D, minterm=$60 (A XOR B)
+	move.w	d0,BLTCON0(a6)
+	clr.w	BLTCON1(a6)
+	move.w	#$FFFF,BLTAFWM(a6)
+	move.w	#$FFFF,BLTALWM(a6)
+	clr.w	BLTAMOD(a6)
+	clr.w	BLTBMOD(a6)
+	clr.w	BLTDMOD(a6)
+	move.l	#BPL1_MIDDLE,BLTAPTH(a6)
+	move.l	#BPL1_MIDDLE,BLTBPTH(a6)
+	move.l	#BPL1_MIDDLE,BLTDPTH(a6)
+	move.w	#(MIDDLE_LINES<<6)|24,BLTSIZE(a6)
+	rts
+
+;==========================================================
+; DrawWireframe — transform octahedron + draw 12 edges
+;==========================================================
+DrawWireframe:
+	movem.l	d2-d7/a2-a5,-(sp)
+	lea	signed_sine_table(pc),a3
+	lea	octa_vertices(pc),a2
+	lea	PROJECTED_VERTS,a4
+
+	; Compute sin/cos of wire_angle for Y rotation
+	move.w	wire_angle(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	(a3,d0.w),d6		; sin
+	move.w	wire_angle(pc),d0
+	add.w	#64,d0
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	(a3,d0.w),d7		; cos
+
+	; Transform 6 vertices → projected 2D (x,y) words
+	moveq	#5,d5
+.xformLoop:
+	move.w	(a2)+,d0		; x
+	move.w	(a2)+,d1		; y
+	move.w	(a2)+,d2		; z
+
+	; Y-axis rotation: x' = x*cos + z*sin, z' = z*cos - x*sin
+	move.w	d0,d3
+	move.w	d2,d4
+	muls	d7,d0			; x*cos
+	muls	d6,d4			; z*sin
+	add.l	d4,d0
+	asr.l	#7,d0			; x'
+	muls	d7,d2			; z*cos
+	muls	d6,d3			; x*sin
+	sub.l	d3,d2
+	asr.l	#7,d2			; z'
+
+	; Simple perspective: project with z offset
+	add.w	#150,d2			; push back
+	cmp.w	#10,d2
+	bge.s	.zPosOk
+	move.w	#10,d2
+.zPosOk:
+	; screen_x = x' * 128 / z' + 54 (center of 108px width in middle area)
+	; screen_y = y * 128 / z' + 54
+	ext.l	d0
+	lsl.l	#7,d0
+	divs	d2,d0
+	add.w	#54,d0			; x in 0..107 range (roughly)
+
+	ext.l	d1
+	lsl.l	#7,d1
+	divs	d2,d1
+	add.w	#54,d1
+
+	move.w	d0,(a4)+		; projected x
+	move.w	d1,(a4)+		; projected y
+	dbf	d5,.xformLoop
+
+	; Draw 12 edges
+	lea	octa_edges(pc),a2
+	lea	PROJECTED_VERTS,a4
+	moveq	#11,d5
+.edgeLoop:
+	move.w	d5,-(sp)		; save loop counter
+
+	; Read edge vertex indices
+	moveq	#0,d0
+	move.b	(a2)+,d0		; v0 index
+	moveq	#0,d1
+	move.b	(a2)+,d1		; v1 index
+	move.l	a2,-(sp)		; save edge pointer
+
+	; Fetch v0 projected coords
+	lsl.w	#2,d0			; *4 bytes per vertex
+	move.w	(a4,d0.w),d2		; v0.x → temp d2
+	move.w	2(a4,d0.w),d3		; v0.y → temp d3
+
+	; Fetch v1 projected coords
+	lsl.w	#2,d1
+	move.w	(a4,d1.w),d4		; v1.x → temp d4
+	move.w	2(a4,d1.w),d5		; v1.y → temp d5
+
+	; Set up DrawLine args: d0=x0, d1=y0, d2=x1, d3=y1
+	move.w	d2,d0			; x0
+	move.w	d3,d1			; y0
+	move.w	d4,d2			; x1
+	move.w	d5,d3			; y1
+	bsr.w	DrawLine
+
+	move.l	(sp)+,a2		; restore edge pointer
+	move.w	(sp)+,d5		; restore loop counter
+	dbf	d5,.edgeLoop
+
+	movem.l	(sp)+,d2-d7/a2-a5
+	rts
+
+;==========================================================
+; DrawLine — Bresenham line (d0,d1)→(d2,d3) into BPL1 middle
+; d0=x0, d1=y0, d2=x1, d3=y1
+; Clips to 0..107 range for both axes
+; Uses: d4-d7, a0, a2 (saved/restored)
+;==========================================================
+DrawLine:
+	movem.l	d4-d7/a2,-(sp)
+	lea	BPL1_MIDDLE,a0
+	lea	yoffset_table(pc),a2
+
+	; Clip all coords to 0..107
+	tst.w	d0
+	bpl.s	.cx0ok
+	moveq	#0,d0
+.cx0ok:	cmp.w	#107,d0
+	ble.s	.cx0ok2
+	move.w	#107,d0
+.cx0ok2:
+	tst.w	d1
+	bpl.s	.cy0ok
+	moveq	#0,d1
+.cy0ok:	cmp.w	#107,d1
+	ble.s	.cy0ok2
+	move.w	#107,d1
+.cy0ok2:
+	tst.w	d2
+	bpl.s	.cx1ok
+	moveq	#0,d2
+.cx1ok:	cmp.w	#107,d2
+	ble.s	.cx1ok2
+	move.w	#107,d2
+.cx1ok2:
+	tst.w	d3
+	bpl.s	.cy1ok
+	moveq	#0,d3
+.cy1ok:	cmp.w	#107,d3
+	ble.s	.cy1ok2
+	move.w	#107,d3
+.cy1ok2:
+
+	; dx = abs(x1-x0), sx = sign → d6
+	move.w	d2,d4
+	sub.w	d0,d4
+	moveq	#1,d6
+	tst.w	d4
+	bpl.s	.dxPos
+	neg.w	d4
+	moveq	#-1,d6
+.dxPos:
+	; dy = -abs(y1-y0), sy = sign → d7
+	move.w	d3,d5
+	sub.w	d1,d5
+	moveq	#1,d7
+	tst.w	d5
+	bmi.s	.dyNeg
+	neg.w	d5
+	bra.s	.dyDone
+.dyNeg:	neg.w	d7
+.dyDone:
+	; Push dx, dy onto stack for loop reference
+	; Stack layout: [sp+0]=dy, [sp+2]=dx
+	move.w	d4,-(sp)		; dx
+	move.w	d5,-(sp)		; dy
+	; d5 = error = dx + dy
+	add.w	d4,d5
+
+.lineLoop:
+	; --- Plot pixel at (d0=x, d1=y) ---
+	; Save error on stack temporarily, use d4/d5 for plot
+	move.w	d5,-(sp)		; save error
+	move.w	d1,d4
+	add.w	d4,d4
+	move.w	(a2,d4.w),d4		; d4 = y * 48
+	move.w	d0,d5
+	lsr.w	#3,d5
+	add.w	d5,d4			; d4 = byte offset
+	move.w	d0,d5
+	not.w	d5
+	and.w	#7,d5
+	bset	d5,(a0,d4.w)		; set pixel
+	move.w	(sp)+,d5		; restore error
+
+	; Check if at endpoint
+	cmp.w	d2,d0
+	bne.s	.notDone
+	cmp.w	d3,d1
+	beq.s	.lineDone
+.notDone:
+	; e2 = 2 * error
+	move.w	d5,d4
+	add.w	d4,d4			; d4 = e2
+
+	; if e2 >= dy: error += dy, x += sx
+	cmp.w	(sp),d4			; e2 vs dy [sp+0]
+	blt.s	.noXstep
+	add.w	(sp),d5
+	add.w	d6,d0
+.noXstep:
+	; if e2 <= dx: error += dx, y += sy
+	cmp.w	2(sp),d4		; e2 vs dx [sp+2]
+	bgt.s	.noYstep
+	add.w	2(sp),d5
+	add.w	d7,d1
+.noYstep:
+	bra.s	.lineLoop
+
+.lineDone:
+	addq.l	#4,sp			; pop dy, dx
+	movem.l	(sp)+,d4-d7/a2
 	rts
 
 ;==========================================================
@@ -987,12 +1807,12 @@ BuildCopper:
 	; --- Sprite pointers ---
 	move.l	#(SPR0PTH<<16)|(SPR0_DATA>>16),(a0)+
 	move.l	#(SPR0PTL<<16)|(SPR0_DATA&$FFFF),(a0)+
-	move.l	#(SPR1PTH<<16)|(NULL_SPR>>16),(a0)+
-	move.l	#(SPR1PTL<<16)|(NULL_SPR&$FFFF),(a0)+
+	move.l	#(SPR1PTH<<16)|(LOGO_SPR1>>16),(a0)+
+	move.l	#(SPR1PTL<<16)|(LOGO_SPR1&$FFFF),(a0)+
 	move.l	#(SPR2PTH<<16)|(SPR2_DATA>>16),(a0)+
 	move.l	#(SPR2PTL<<16)|(SPR2_DATA&$FFFF),(a0)+
-	move.l	#(SPR3PTH<<16)|(NULL_SPR>>16),(a0)+
-	move.l	#(SPR3PTL<<16)|(NULL_SPR&$FFFF),(a0)+
+	move.l	#(SPR3PTH<<16)|(LOGO_SPR3>>16),(a0)+
+	move.l	#(SPR3PTL<<16)|(LOGO_SPR3&$FFFF),(a0)+
 	move.l	#(SPR4PTH<<16)|(SPR4_DATA>>16),(a0)+
 	move.l	#(SPR4PTL<<16)|(SPR4_DATA&$FFFF),(a0)+
 	move.l	#(SPR5PTH<<16)|(NULL_SPR>>16),(a0)+
@@ -1002,11 +1822,36 @@ BuildCopper:
 	move.l	#(SPR7PTH<<16)|(NULL_SPR>>16),(a0)+
 	move.l	#(SPR7PTL<<16)|(NULL_SPR&$FFFF),(a0)+
 
-	; Sprite colors (one color per pair)
-	move.l	#($01A6<<16)|$0F44,(a0)+	; spr0 col3 = red
-	move.l	#($01AE<<16)|$04F4,(a0)+	; spr2 col3 = green
-	move.l	#($01B6<<16)|$048F,(a0)+	; spr4 col3 = blue
-	move.l	#($01BE<<16)|$0FF4,(a0)+	; spr6 col3 = yellow
+	; Sprite colors — pairs 0+1 and 2+3 pulse with bounce_pulse
+	; Base: spr0+1 = red ($F44), spr2+3 = green ($4F4)
+	; Pulse adds brightness per nibble
+	move.w	bounce_pulse(pc),d0	; 0-15
+	lsr.w	#1,d0			; 0-7
+
+	; Pair 0+1 color 3: red + pulse
+	move.w	#$0F44,d1
+	add.w	d0,d1			; boost blue
+	move.w	d0,-(sp)
+	lsl.w	#4,d0
+	add.w	d0,d1			; boost green
+	move.w	(sp)+,d0
+	move.w	#$01A6,(a0)+
+	move.w	d1,(a0)+
+
+	; Pair 2+3 color 3: green + pulse
+	move.w	#$04F4,d1
+	add.w	d0,d1			; boost blue
+	move.w	d0,-(sp)
+	lsl.w	#8,d0
+	add.w	d0,d1			; boost red
+	move.w	(sp)+,d0
+	move.w	#$01AE,(a0)+
+	move.w	d1,(a0)+
+
+	; Pair 4+5: blue (EQ only, no bounce)
+	move.l	#($01B6<<16)|$048F,(a0)+
+	; Pair 6+7: yellow (EQ only)
+	move.l	#($01BE<<16)|$0FF4,(a0)+
 
 	; Load table pointers
 	lea	sine_table(pc),a2
@@ -1128,22 +1973,29 @@ BuildCopper:
 	blt.w	.logoLine
 
 	; ============================================
-	; MIDDLE ZONE start ($6C): disable BPL1 text
-	; Set BPL1PT to a blank area (after BPL2) and COLOR01=$000
+	; MIDDLE ZONE start ($6C): enable BPL1 for effects
+	; Set BPL1PT = BPL1_MIDDLE, COLOR01=$FFF
 	; ============================================
 	; WAIT for middle start
 	move.w	#(MIDDLE_START<<8)|$07,(a0)+
 	move.w	#$FFFE,(a0)+
-	; Point BPL1 to end of BPL2 (zeroed area in initial clear)
-	move.l	#(BPL1PTH<<16)|((BPLANE2+BPSIZE)>>16),(a0)+
-	move.l	#(BPL1PTL<<16)|((BPLANE2+BPSIZE)&$FFFF),(a0)+
-	move.l	#(COLOR01<<16)|$0000,(a0)+
+	; Point BPL1 to middle zone area
+	move.l	#(BPL1PTH<<16)|(BPL1_MIDDLE>>16),(a0)+
+	move.l	#(BPL1PTL<<16)|(BPL1_MIDDLE&$FFFF),(a0)+
+	move.l	#(COLOR01<<16)|$0FFF,(a0)+
 
 	; ============================================
 	; MIDDLE ZONE: lines $6C - $D7 (108 lines)
-	; Per line: WAIT + COLOR00(plasma or raster bar)
+	; Per line: WAIT + COLOR00(tunnel/rasterbar) + COLOR02(rainbow) + COLOR03(rainbow)
+	; Conditional: + BPL2PTH/L (glitch) when flash_timer > 0
 	; ============================================
 	moveq	#0,d5			; line counter
+	lea	TUNNEL_COLORS,a1
+	move.l	a1,-(sp)		; save tunnel colors ptr
+	lea	STAR_COLORS,a1
+	move.l	a1,-(sp)		; save star colors ptr
+	lea	GLITCH_OFFSETS,a1
+	move.l	a1,-(sp)		; save glitch ptr
 
 .middleLine:
 	move.w	#MIDDLE_START,d0
@@ -1163,7 +2015,7 @@ BuildCopper:
 	move.w	d1,(a0)+
 	move.w	#$FFFE,(a0)+
 
-	; Check raster bars: is this line within any bar?
+	; COLOR00: check raster bars first, else use tunnel color
 	move.w	#MIDDLE_START,d0
 	add.w	d5,d0			; d0 = current VPOS
 	moveq	#3,d3			; bar index (3..0)
@@ -1182,15 +2034,13 @@ BuildCopper:
 	bra.s	.barMiss
 
 .barHit:
-	; d3 = bar index, compute gradient index
-	; signed distance: center - current
+	; d3 = bar index, compute gradient color
 	move.w	d3,d1
 	add.w	d1,d1
 	lea	bar_y(pc),a1
 	move.w	0(a1,d1.w),d1		; center
 	sub.w	d1,d0			; d0 = current - center (-7..+7)
 	add.w	#8,d0			; index 0-15
-	; Clamp
 	bpl.s	.bIdxOk
 	moveq	#0,d0
 .bIdxOk:
@@ -1198,64 +2048,102 @@ BuildCopper:
 	ble.s	.bIdxOk2
 	moveq	#15,d0
 .bIdxOk2:
-	add.w	d0,d0			; word offset into gradient
-	; Get gradient table for bar d3
+	add.w	d0,d0
 	move.w	d3,d1
-	lsl.w	#5,d1			; *32 bytes (16 words)
+	lsl.w	#5,d1
 	lea	rasterbar_red(pc),a1
 	add.w	d1,a1
-	move.w	0(a1,d0.w),d0		; gradient color
+	move.w	0(a1,d0.w),d0
 	tst.w	d7
 	beq.s	.barNoFlash
 	bsr.w	ApplyFlash
 .barNoFlash:
 	move.w	#COLOR00,(a0)+
 	move.w	d0,(a0)+
-	bra.s	.middleNext
+	bra.s	.middleCol23
 
 .barMiss:
-	; No bar hit — use plasma
+	; No bar hit — use tunnel color from pre-computed buffer
+	move.l	8(sp),a1		; tunnel colors ptr
 	move.w	d5,d0
-	add.w	#64,d0
 	add.w	d0,d0
-	add.w	d2,d0
-	and.w	#$1FE,d0
-	move.w	#COLOR00,(a0)+
-	move.w	0(a3,d0.w),d0
+	move.w	(a1,d0.w),d0		; tunnel color for this line
 	tst.w	d7
 	beq.s	.mNoFlash
 	bsr.w	ApplyFlash
 .mNoFlash:
+	move.w	#COLOR00,(a0)+
 	move.w	d0,(a0)+
 
-.middleNext:
+.middleCol23:
+	; COLOR02 + COLOR03 from rainbow star colors buffer
+	move.l	4(sp),a1		; star colors ptr
+	move.w	d5,d0
+	lsl.w	#2,d0			; *4 (2 words per line)
+	move.w	#COLOR02,(a0)+
+	move.w	(a1,d0.w),(a0)+		; COLOR02
+	move.w	#COLOR03,(a0)+
+	move.w	2(a1,d0.w),(a0)+	; COLOR03
+
+	; Conditional glitch: BPL2PTH/L
+	move.w	flash_timer(pc),d0
+	beq.s	.noGlitch
+	move.l	(sp),a1			; glitch offsets ptr
+	move.w	d5,d0
+	lsl.w	#2,d0			; *4 (longword per line)
+	move.l	(a1,d0.w),d0		; random BPL2 address
+	move.w	#BPL2PTH,(a0)+
+	swap	d0
+	move.w	d0,(a0)+
+	move.w	#BPL2PTL,(a0)+
+	swap	d0
+	move.w	d0,(a0)+
+.noGlitch:
+
 	addq.w	#1,d5
-	cmp.w	#108,d5
+	cmp.w	#MIDDLE_LINES,d5
 	blt.w	.middleLine
 
-	; ============================================
-	; SCROLL ZONE: lines $D8 - $FF + barrier + $00-$0B
-	; Re-enable BPL1, apply sine wave + rainbow
-	; ============================================
-	; Compute BPL1 base for scroll area
-	move.l	#SCROLL_AREA,d4
+	lea	12(sp),sp		; pop 3 saved pointers
 
-	moveq	#0,d5
-	moveq	#0,d1			; barrier flag
+	; ============================================
+	; SCROLL ZONE transition: reset BPL2PT (undo glitch)
+	; ============================================
+	move.l	#(BPL2PTH<<16)|(BPLANE2>>16),(a0)+
+	move.l	#(BPL2PTL<<16)|(BPLANE2&$FFFF),(a0)+
+	move.l	#(COLOR01<<16)|$0000,(a0)+	; disable BPL1 text color
+
+	; ============================================
+	; SCROLL ZONE: lines $D8 - $FF (40 lines)
+	; Pre-rendered copper-only sine scroller
+	; Per line: WAIT + COLOR00 + COLOR01 + BPL1PT
+	; 5x vertical scaling (8 font rows × 5 scanlines)
+	; No V8 barrier needed ($D8-$FF < $100)
+	; ============================================
+
+	; Compute scroll parameters
+	move.w	scroll_pixel_pos(pc),d0
+	move.w	d0,d1
+	and.w	#15,d1			; fine = pixel_pos & 15
+
+	; Set BPLCON1: PF1H = fine, PF2H = 0 (stars unaffected)
+	move.w	#BPLCON1,(a0)+
+	move.w	d1,(a0)+
+
+	; Compute base pointer: SCROLL_BUF + coarse
+	lsr.w	#4,d0
+	add.w	d0,d0			; coarse = (pixel_pos >> 4) * 2
+	ext.l	d0
+	add.l	#SCROLL_BUF,d0
+	move.l	d0,-(sp)		; [sp] = base_ptr (constant)
+
+	moveq	#0,d4			; font_row_base = 0 (high word also 0)
+	move.w	#4,a5			; sub-line counter (4..0 = 5 lines/row)
+	moveq	#0,d5			; scanline counter
 
 .scrollLine:
 	move.w	#SCROLL_START,d0
-	add.w	d5,d0
-
-	; V8 barrier
-	tst.w	d1
-	bne.s	.sPastBarrier
-	cmp.w	#$100,d0
-	blt.s	.sNoBarrier
-	move.l	#$FFDFFFFE,(a0)+
-	moveq	#1,d1
-.sNoBarrier:
-.sPastBarrier:
+	add.w	d5,d0			; VPOS
 
 	; WAIT
 	move.w	d0,d1
@@ -1264,19 +2152,12 @@ BuildCopper:
 	or.w	#$07,d1
 	move.w	d1,(a0)+
 	move.w	#$FFFE,(a0)+
-	; Reload barrier flag
-	move.w	#SCROLL_START,d0
-	add.w	d5,d0
-	cmp.w	#$100,d0
-	sge	d1
-	ext.w	d1
-	neg.w	d1
 
 	; COLOR00 = plasma
 	move.w	d5,d0
 	add.w	#172,d0			; offset past logo+middle
 	add.w	d0,d0
-	add.w	d2,d0
+	add.w	d2,d0			; + plasma_phase1
 	and.w	#$1FE,d0
 	move.w	#COLOR00,(a0)+
 	move.w	0(a3,d0.w),d0
@@ -1289,7 +2170,7 @@ BuildCopper:
 	; COLOR01 = rainbow
 	move.w	d5,d0
 	add.w	#172,d0
-	add.w	d3,d0
+	add.w	d3,d0			; + rainbow_phase
 	and.w	#$FF,d0
 	add.w	d0,d0
 	move.w	#COLOR01,(a0)+
@@ -1300,29 +2181,40 @@ BuildCopper:
 .sNoFlash2:
 	move.w	d0,(a0)+
 
-	; BPL1PT with sine offset
+	; BPL1PT = base_ptr + font_row_base + sine_offset
 	move.w	d5,d0
-	add.w	d6,d0
+	add.w	d6,d0			; + sine_phase
 	and.w	#$FF,d0
 	moveq	#0,d1
-	move.b	0(a2,d0.w),d1
+	move.b	0(a2,d0.w),d1		; sine 0-48
+	lsr.w	#SCROLL_SINE_SHIFT,d1	; halve → 0-24
 	and.w	#$FFFE,d1		; word-align
 	ext.l	d1
-	move.l	d4,d0
-	add.l	d1,d0
+	add.l	(sp),d1			; + base_ptr
+	add.l	d4,d1			; + font_row_base (high word = 0)
 
 	move.w	#BPL1PTH,(a0)+
-	swap	d0
-	move.w	d0,(a0)+
+	swap	d1
+	move.w	d1,(a0)+
 	move.w	#BPL1PTL,(a0)+
-	swap	d0
-	move.w	d0,(a0)+
+	swap	d1
+	move.w	d1,(a0)+
 
-	add.l	#BPWIDTH,d4
+	; Advance sub-line / font row (5x vertical scaling)
+	move.w	a5,d0
+	subq.w	#1,d0
+	bpl.s	.subOk
+	moveq	#4,d0			; reset sub-counter
+	add.w	#SCROLL_BUF_STRIDE,d4	; next font row
+.subOk:
+	move.w	d0,a5
 
 	addq.w	#1,d5
 	cmp.w	#SCROLL_LINES,d5
 	blt.w	.scrollLine
+
+	; Pop base_ptr from stack
+	addq.l	#4,sp
 
 	; End copper list
 	move.l	#$FFFFFFFE,(a0)+
