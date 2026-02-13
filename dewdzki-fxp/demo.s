@@ -11,6 +11,8 @@ COPPER_B	equ	$41800		; copper list back buffer (6 KB)
 BPLANE1		equ	$43000		; bitplane 1: logo (48*256 = 12 KB)
 BPLANE2		equ	$46000		; bitplane 2: stars (48*256 = 12 KB)
 
+; Scroll buffer in free chip RAM
+SCROLL_BUF	equ	$3E800		; scroll text buffer (48*64 = 3072 bytes)
 ; Star array in free chip RAM before buffers
 STAR_ARRAY	equ	$3FB50		; 120*10 = 1200 bytes
 
@@ -51,6 +53,17 @@ EFFECT_DISPLAY	equ	2
 NUM_SHAPES	equ	4
 SHAPE_DISPLAY_TIME equ	250		; 5 seconds at 50fps
 MORPH_DURATION	equ	128		; frames to morph
+
+; Scroll text constants
+SCROLL_ZONE_Y	equ	192		; first scanline of scroll zone
+SCROLL_ZONE_H	equ	64		; lines in scroll zone
+SCROLL_BUF_W	equ	48		; bytes per line (same as main)
+FONT_CHAR_H	equ	32		; pixels tall per character
+FONT_CHAR_SIZE	equ	2*FONT_CHAR_H	; 64 bytes per character
+FONT_FIRST	equ	32		; first ASCII code in font table
+FONT_LAST	equ	90		; last ASCII code ('Z')
+SINE_AMP	equ	16		; ±16 pixels vertical bounce
+SCROLL_SPEED	equ	2		; pixels per frame
 
 ; Star struct offsets
 STAR_SX		equ	0		; signed X offset
@@ -112,8 +125,15 @@ Start:
 	; Draw logo bitmap into bitplane 1
 	bsr.w	DrawLogo
 
+	; Clear scroll buffer
+	lea	SCROLL_BUF,a0
+	move.w	#(SCROLL_BUF_W*SCROLL_ZONE_H/4)-1,d0
+.clrs:	clr.l	(a0)+
+	dbf	d0,.clrs
+
 	; Init stars
 	bsr.w	InitStars
+	bsr.w	InitScroll
 
 	; Init shape cycling state
 	clr.w	effect_state
@@ -208,6 +228,9 @@ MainLoop:
 	bsr.w	StartNextMorph
 .stateEnd:
 
+	; Render scroll text into buffer
+	bsr.w	RenderScrollText
+
 	; Build next frame into back buffer
 	move.l	cop_back(pc),a0
 	bsr.w	BuildCopper
@@ -256,6 +279,9 @@ rot_cos_x:	dc.w	0
 channel_energies: dc.w	0,0,0,0		; per-channel attack/decay (0-64)
 terrain_phase1:	dc.w	0		; slow vertical wave phase
 terrain_phase2:	dc.w	0		; fast vertical ripple phase
+scroll_offset:	dc.w	0		; pixel scroll position
+scroll_phase:	dc.w	0		; sine wave phase for bounce
+scroll_text_len: dc.w	0		; computed at init
 
 ;==========================================================
 ; WaitVBL — wait for line 300, then wait for it to pass
@@ -766,6 +792,122 @@ ShapeStars:
 	rts
 
 ;==========================================================
+; InitScroll — compute scroll text length
+;==========================================================
+InitScroll:
+	lea	scroll_text(pc),a0
+	moveq	#0,d0
+.len:	tst.b	(a0)+
+	beq.s	.lenDone
+	addq.w	#1,d0
+	bra.s	.len
+.lenDone:
+	move.w	d0,scroll_text_len
+	clr.w	scroll_offset
+	clr.w	scroll_phase
+	rts
+
+;==========================================================
+; RenderScrollText — draw sine-bouncing scroll text
+; Clears SCROLL_BUF, renders 24 characters with sine Y offset
+; Advances scroll_offset and scroll_phase each frame
+; Trashes: d0-d7, a0-a5
+;==========================================================
+RenderScrollText:
+	movem.l	d2-d7/a2-a5,-(sp)
+
+	; Clear scroll buffer (48*64 = 3072 bytes = 768 longs)
+	lea	SCROLL_BUF,a0
+	move.w	#(SCROLL_BUF_W*SCROLL_ZONE_H/4)-1,d0
+.clr:	clr.l	(a0)+
+	dbf	d0,.clr
+
+	; Compute first visible character index
+	move.w	scroll_offset(pc),d7
+	lsr.w	#4,d7			; d7 = scroll_char (first visible)
+
+	lea	signed_sine_table(pc),a5
+	lea	yoffset_table(pc),a4
+
+	moveq	#23,d5			; 24 character positions
+	moveq	#0,d4			; position counter (0..23)
+
+.charLoop:
+	; Compute text index with wrapping
+	move.w	d7,d0
+	add.w	d4,d0			; char_index = scroll_char + position
+.modWrap:
+	cmp.w	scroll_text_len(pc),d0
+	blt.s	.modDone
+	sub.w	scroll_text_len(pc),d0
+	bra.s	.modWrap
+.modDone:
+
+	; Fetch ASCII character
+	lea	scroll_text(pc),a1
+	moveq	#0,d6
+	move.b	0(a1,d0.w),d6		; d6 = ASCII code
+	beq.s	.skipChar		; should not happen after wrap, but safety
+
+	; Font lookup: (ascii - FONT_FIRST) * FONT_CHAR_SIZE
+	sub.w	#FONT_FIRST,d6
+	bmi.s	.skipChar
+	cmp.w	#FONT_LAST-FONT_FIRST,d6
+	bgt.s	.skipChar
+	lsl.w	#6,d6			; * 64 = FONT_CHAR_SIZE
+	lea	font_data,a2
+	add.w	d6,a2			; a2 = font bitmap for this char
+
+	; Compute sine Y offset for this character position
+	move.w	d4,d0
+	lsl.w	#3,d0			; * 8 (spread sine across chars)
+	add.w	scroll_phase(pc),d0
+	and.w	#$FF,d0
+	add.w	d0,d0			; word index
+	move.w	0(a5,d0.w),d0		; signed sine -127..+127
+	muls	#SINE_AMP,d0
+	asr.l	#7,d0
+	add.w	#SINE_AMP,d0		; 0..2*SINE_AMP = 0..32
+
+	; Destination = SCROLL_BUF + y_off * 48 + char_pos * 2
+	add.w	d0,d0			; word index for yoffset table
+	move.w	0(a4,d0.w),d3		; y * 48
+	move.w	d4,d0
+	add.w	d0,d0			; char_pos * 2 bytes
+	add.w	d0,d3			; d3 = byte offset in buffer
+	lea	SCROLL_BUF,a1
+	add.w	d3,a1			; a1 = destination ptr
+
+	; Copy 32 rows of 2 bytes (16 pixels wide)
+	moveq	#FONT_CHAR_H-1,d3
+.rowCopy:
+	move.w	(a2)+,(a1)
+	lea	SCROLL_BUF_W(a1),a1	; next row in buffer
+	dbf	d3,.rowCopy
+
+.skipChar:
+	addq.w	#1,d4
+	dbf	d5,.charLoop
+
+	; Advance scroll offset
+	move.w	scroll_offset(pc),d0
+	add.w	#SCROLL_SPEED,d0
+	; Wrap when past text length in pixels
+	move.w	scroll_text_len(pc),d1
+	lsl.w	#4,d1			; text_len * 16 pixels
+	cmp.w	d1,d0
+	blt.s	.noWrap
+	sub.w	d1,d0
+.noWrap:
+	move.w	d0,scroll_offset
+	; Advance sine phase
+	addq.w	#3,scroll_phase
+	and.w	#$FF,scroll_phase
+
+	movem.l	(sp)+,d2-d7/a2-a5
+	rts
+
+;==========================================================
 ; BuildCopper — build copper list at (a0)
 ;==========================================================
 BuildCopper:
@@ -906,8 +1048,91 @@ BuildCopper:
 
 	addq.w	#1,d4
 	addq.w	#1,d5
-	cmp.w	#BPHEIGHT,d4
+	cmp.w	#SCROLL_ZONE_Y,d4
 	blt.w	.perLine
+
+	; ============================================
+	; Scroll zone transition at line 192 (VPOS $EC)
+	; ============================================
+
+	; WAIT for scroll zone start
+	move.w	d5,d0
+	and.w	#$FF,d0
+	lsl.w	#8,d0
+	or.w	#$07,d0
+	move.w	d0,(a0)+
+	move.w	#$FFFE,(a0)+
+
+	; Switch to 1 bitplane (hides stars in scroll zone)
+	move.l	#(BPLCON0<<16)|$1200,(a0)+
+
+	; BPL1PT = SCROLL_BUF + coarse scroll offset
+	move.w	scroll_offset(pc),d0
+	and.w	#15,d0			; fine pixel
+	move.w	d0,d6			; save fine_pixel
+	neg.w	d0
+	and.w	#15,d0			; bplcon1 value
+	move.w	d0,d7			; save bplcon1 val
+
+	; coarse = 0 when fine_pixel==0, else 2
+	moveq	#0,d3
+	tst.w	d6
+	beq.s	.noCoarse
+	moveq	#2,d3
+.noCoarse:
+	move.l	#SCROLL_BUF,d0
+	add.l	d3,d0			; BPL1PT = SCROLL_BUF + coarse
+
+	move.w	#BPL1PTH,(a0)+
+	swap	d0
+	move.w	d0,(a0)+
+	move.w	#BPL1PTL,(a0)+
+	swap	d0
+	move.w	d0,(a0)+
+
+	; BPLCON1 = scroll fine value
+	move.w	#BPLCON1,(a0)+
+	move.w	d7,(a0)+
+
+	; Scroll zone background color
+	move.l	#(COLOR00<<16)|$0112,(a0)+
+
+	; Advance past transition line
+	addq.w	#1,d4
+	addq.w	#1,d5
+
+	; --- Scroll zone per-line: WAIT + COLOR01 gradient ---
+.scrollLine:
+	; V8 barrier (VPOS $100 = line 212)
+	tst.w	d1
+	bne.s	.sPastBar
+	cmp.w	#$100,d5
+	blt.s	.sNoBar
+	move.l	#$FFDFFFFE,(a0)+
+	moveq	#1,d1
+.sNoBar:
+.sPastBar:
+	; WAIT
+	move.w	d5,d0
+	and.w	#$FF,d0
+	lsl.w	#8,d0
+	or.w	#$07,d0
+	move.w	d0,(a0)+
+	move.w	#$FFFE,(a0)+
+
+	; COLOR01 = gradient for scroll text (offset +128 for contrast)
+	move.w	d4,d0
+	add.w	d2,d0
+	add.w	#128,d0			; phase offset from logo gradient
+	and.w	#$FF,d0
+	add.w	d0,d0
+	move.w	#COLOR01,(a0)+
+	move.w	0(a3,d0.w),(a0)+
+
+	addq.w	#1,d4
+	addq.w	#1,d5
+	cmp.w	#BPHEIGHT,d4
+	blt.w	.scrollLine
 
 	; End
 	move.l	#$FFFFFFFE,(a0)+
@@ -929,6 +1154,17 @@ DrawLogo:
 ;==========================================================
 ; Data
 ;==========================================================
+scroll_text:
+	dc.b	"DEWDZKI WILL NEVER DIE - GREETZ GO OUT TO"
+	dc.b	" - SICK0 - ZZZ - RIZZ - ZOCH - FERRE070"
+	dc.b	" - TEDY - REDBARON -- WE WILL NEVER FORGET"
+	dc.b	" KOPYKATZ, ROSEVALLEY AND OTHER FXP"
+	dc.b	" ADVENTURES, I'LL UPLOAD THIS TO THE"
+	dc.b	" INTERNET ARCHIVE - DEWZKI WILL NEVER"
+	dc.b	" DIE.......          "
+	dc.b	0
+	even
+
 LogoBitmap:
 	incbin	"logo.bin"
 
